@@ -18,7 +18,23 @@ type DeviceConfig struct {
 	Feed       string `json:"feed"`                // feed.adsbiq.com:30004 (ADS-B Beast)
 	LocalBeast string `json:"local_beast"`         // 127.0.0.1:30005 (decoder Beast out)
 
+	// Decoder / dongle management (the installer bundles the decoders next to the
+	// agent; the agent enumerates dongles, assigns a role to each, and supervises
+	// the matching decoder).
+	DecoderDir string       `json:"decoder_dir,omitempty"` // dir holding the decoder exes (default: <exe dir>)
+	VDL2Feed   string       `json:"vdl2_feed,omitempty"`   // feed.adsbiq.com:5552 (VDL2 UDP)
+	Gain       string       `json:"gain,omitempty"`        // rtl tuner gain (default "40")
+	VDL2Freqs  []string     `json:"vdl2_freqs,omitempty"`  // VDL2 channels in Hz
+	Roles      []DongleRole `json:"roles,omitempty"`       // persisted per-serial role assignments
+
 	path string `json:"-"`
+}
+
+// DongleRole pins a dongle (by USB serial) to a decoder role so the agent does
+// not have to re-probe on every start, and so the server can override a role.
+type DongleRole struct {
+	Serial string `json:"serial"`
+	Role   string `json:"role"` // "adsb" | "vdl2" | "off"
 }
 
 // defaultConfigPath is a per-OS location a service can write to.
@@ -62,7 +78,50 @@ func LoadConfig(path string) *DeviceConfig {
 	if c.LocalBeast == "" {
 		c.LocalBeast = "127.0.0.1:30005"
 	}
+	if c.VDL2Feed == "" {
+		c.VDL2Feed = "feed.adsbiq.com:5552"
+	}
+	if c.Gain == "" {
+		c.Gain = "40"
+	}
+	if len(c.VDL2Freqs) == 0 {
+		// Common VDL2 channels (Hz), within one 2.1 Msps window.
+		c.VDL2Freqs = []string{
+			"136650000", "136700000", "136725000", "136750000", "136775000",
+			"136800000", "136825000", "136875000", "136975000",
+		}
+	}
+	if c.DecoderDir == "" {
+		if exe, err := os.Executable(); err == nil {
+			c.DecoderDir = filepath.Dir(exe)
+		}
+	}
 	return c
+}
+
+// roleFor returns the persisted role for a dongle serial, or "" if unassigned.
+func (c *DeviceConfig) roleFor(serial string) string {
+	for _, r := range c.Roles {
+		if r.Serial == serial {
+			return r.Role
+		}
+	}
+	return ""
+}
+
+// setRole records (or updates) a dongle's role and returns whether it changed.
+func (c *DeviceConfig) setRole(serial, role string) bool {
+	for i := range c.Roles {
+		if c.Roles[i].Serial == serial {
+			if c.Roles[i].Role == role {
+				return false
+			}
+			c.Roles[i].Role = role
+			return true
+		}
+	}
+	c.Roles = append(c.Roles, DongleRole{Serial: serial, Role: role})
+	return true
 }
 
 // Save writes the config atomically (temp + rename) so a crash mid-write can't
