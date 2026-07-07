@@ -258,10 +258,10 @@ func (m *DecoderManager) probeADSB(ctx context.Context, d Dongle) bool {
 	}
 	pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	// gvanem/Dump1090: `--device N --net`; Beast output listens on :30005 (from
-	// the bundled cfg). Nothing else is running on it yet during role assignment.
-	const probePort = "30005"
-	cmd := exec.CommandContext(pctx, exe, "--device", strconv.Itoa(d.Index), "--net")
+	// Probe on a dedicated Beast port so it can't collide with a real decoder.
+	const probePort = "31005"
+	cmd := exec.CommandContext(pctx, exe, "--device-index", strconv.Itoa(d.Index),
+		"--net", "--net-beast", "--net-bo-port", probePort)
 	configureChild(cmd)
 	if err := cmd.Start(); err != nil {
 		log.Printf("probe: cannot start ADS-B decoder: %v", err)
@@ -334,10 +334,9 @@ func (m *DecoderManager) buildDecoderCmd(ctx context.Context, role string, d Don
 		if !ok {
 			return nil, fmt.Errorf("%s not found in %s", adsbExeName(), m.cfg.DecoderDir)
 		}
-		// gvanem/Dump1090 CLI: `--device N --net`. Its Beast-output listen port
-		// (:30005, which the forwarder relays to the network) comes from a
-		// dump1090.cfg bundled next to the exe — see installer/dist/decoders.
-		return exec.CommandContext(ctx, exe, "--device", strconv.Itoa(d.Index), "--net"), nil
+		// dump1090 serves Beast on :30005; the forwarder relays it to the network.
+		return exec.CommandContext(ctx, exe, "--device-index", strconv.Itoa(d.Index),
+			"--net", "--net-beast", "--net-bo-port", "30005"), nil
 	case RoleVDL2:
 		exe, ok := exePath(m.cfg.DecoderDir, vdl2ExeName())
 		if !ok {
