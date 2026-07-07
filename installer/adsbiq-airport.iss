@@ -1,0 +1,127 @@
+; ADSBiq Airport feeder — one-click Windows installer (Inno Setup 6).
+;
+; Assembles the feed agent + decoders into a single .exe that:
+;   1. installs the WinUSB driver for the RTL-SDR dongle (silent, via libwdi),
+;   2. drops the agent + bundled decoders,
+;   3. registers a background Windows service (WinSW) that runs the agent,
+;   4. optionally tags the device with the school / FBO name the user typed.
+;
+; Build inputs live under installer\dist\ — see installer\BUILD.md for how to
+; assemble them from the CI artifacts. Compile with: iscc adsbiq-airport.iss
+
+#define AppName "ADSBiq Airport Feeder"
+#define AppVer "0.3.0"
+#define AppPublisher "ADSBiq"
+#define AppURL "https://adsbiq.com/airport"
+; RTL2832U (all RTL-SDR dongles): USB VID 0x0BDA, PID 0x2838
+#define RtlVid "0x0BDA"
+#define RtlPid "0x2838"
+
+[Setup]
+AppName={#AppName}
+AppVersion={#AppVer}
+AppPublisher={#AppPublisher}
+AppPublisherURL={#AppURL}
+DefaultDirName={autopf}\ADSBiq
+DefaultGroupName=ADSBiq
+DisableProgramGroupPage=yes
+OutputDir=out
+OutputBaseFilename=adsbiq-airport-setup-{#AppVer}
+Compression=lzma2
+SolidCompression=yes
+WizardStyle=modern
+; driver install + service registration require elevation
+PrivilegesRequired=admin
+ArchitecturesInstallIn64BitMode=x64compatible
+ArchitecturesAllowed=x64compatible
+UninstallDisplayName={#AppName}
+
+[Files]
+; the agent
+Source: "dist\adsbiq-feed-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
+; decoders + their runtime DLLs (dumpvdl2 today; dump1090 added when built)
+Source: "dist\decoders\*"; DestDir: "{app}\decoders"; Flags: ignoreversion recursesubdirs createallsubdirs
+; WinSW service host (renamed) — reads adsbiq-service.xml written at install time
+Source: "dist\service\WinSW.exe"; DestDir: "{app}\service"; DestName: "adsbiq-service.exe"; Flags: ignoreversion
+; silent WinUSB driver installer (libwdi wdi-simple)
+Source: "dist\driver\wdi-simple.exe"; DestDir: "{app}\driver"; Flags: ignoreversion skipifsourcedoesntexist
+
+[Icons]
+Name: "{group}\ADSBiq live map"; Filename: "{#AppURL}"
+Name: "{group}\Uninstall ADSBiq Feeder"; Filename: "{uninstallexe}"
+
+[Run]
+; 1) bind WinUSB to the dongle (silent). -b: don't pop the Zadig UI; runs only if present.
+Filename: "{app}\driver\wdi-simple.exe"; \
+  Parameters: "--vid {#RtlVid} --pid {#RtlPid} --type 0 -b -n ""RTL2832U"""; \
+  StatusMsg: "Installing USB driver for your dongle..."; \
+  Flags: runhidden waituntilterminated skipifdoesntexist
+; 2) install + start the background service (config written in CurStepChanged)
+Filename: "{app}\service\adsbiq-service.exe"; Parameters: "install"; Flags: runhidden waituntilterminated
+Filename: "{app}\service\adsbiq-service.exe"; Parameters: "start"; Flags: runhidden waituntilterminated
+; 3) offer to open the live map
+Filename: "{#AppURL}"; Description: "Open the ADSBiq live map"; Flags: postinstall shellexec nowait
+
+[UninstallRun]
+Filename: "{app}\service\adsbiq-service.exe"; Parameters: "stop"; Flags: runhidden waituntilterminated; RunOnceId: "StopSvc"
+Filename: "{app}\service\adsbiq-service.exe"; Parameters: "uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "DelSvc"
+
+[Code]
+var
+  OrgPage: TInputQueryWizardPage;
+
+procedure InitializeWizard;
+begin
+  OrgPage := CreateInputQueryPage(wpSelectDir,
+    'Name your airfield (optional)',
+    'Put your flight school or FBO on the map.',
+    'If you enter a name, your feeder shows up on the ADSBiq network under it. ' +
+    'Leave it blank to feed anonymously. You can change this later.');
+  OrgPage.Add('School / FBO / organization name:', False);
+end;
+
+// XML-escape the few characters that matter for the WinSW config.
+function XmlEscape(const S: string): string;
+begin
+  Result := S;
+  StringChangeEx(Result, '&', '&amp;', True);
+  StringChangeEx(Result, '<', '&lt;', True);
+  StringChangeEx(Result, '>', '&gt;', True);
+  StringChangeEx(Result, '"', '&quot;', True);
+end;
+
+// Write the WinSW service definition (points at the agent + bundled decoders,
+// injects the optional org name) before the service is installed.
+procedure WriteServiceConfig;
+var
+  Xml, Args, Org, Path: string;
+begin
+  Org := Trim(OrgPage.Values[0]);
+  Args := '--decoders "' + ExpandConstant('{app}\decoders') + '"';
+  if Org <> '' then
+    Args := Args + ' --org "' + Org + '"';
+
+  Xml :=
+    '<service>' + #13#10 +
+    '  <id>adsbiq-agent</id>' + #13#10 +
+    '  <name>ADSBiq Feeder Agent</name>' + #13#10 +
+    '  <description>Feeds ADS-B / VDL2 from your dongle to the ADSBiq network.</description>' + #13#10 +
+    '  <executable>' + XmlEscape(ExpandConstant('{app}\adsbiq-feed-agent.exe')) + '</executable>' + #13#10 +
+    '  <arguments>' + XmlEscape(Args) + '</arguments>' + #13#10 +
+    '  <onfailure action="restart" delay="10 sec"/>' + #13#10 +
+    '  <resetfailure>1 hour</resetfailure>' + #13#10 +
+    '  <priority>idle</priority>' + #13#10 +
+    '  <startmode>Automatic</startmode>' + #13#10 +
+    '  <log mode="roll-by-size"><sizeThreshold>5120</sizeThreshold><keepFiles>3</keepFiles></log>' + #13#10 +
+    '</service>' + #13#10;
+
+  Path := ExpandConstant('{app}\service\adsbiq-service.xml');
+  if not SaveStringToFile(Path, Xml, False) then
+    MsgBox('Could not write the service configuration.', mbError, MB_OK);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    WriteServiceConfig;  // runs before the [Run] service-install entries
+end;

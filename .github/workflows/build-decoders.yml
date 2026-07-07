@@ -1,6 +1,7 @@
-# Builds the Windows VDL2 decoder (dumpvdl2.exe) + its runtime DLLs under MSYS2,
-# so the installer can bundle a second-dongle (136 MHz) decoder with no local
-# toolchain. Produces a downloadable artifact and, on a tag, a release asset.
+# Builds the Windows native binaries the installer bundles, under MSYS2, so no
+# local toolchain is needed: the VDL2 decoder (dumpvdl2.exe) and the silent
+# WinUSB driver installer (wdi-simple.exe, from libwdi — Zadig's engine).
+# Each job uploads an artifact and, on a tag, a release asset.
 name: build-decoders
 
 on:
@@ -88,3 +89,43 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
+
+  # Silent WinUSB driver installer. libwdi is the engine behind Zadig; the MSYS2
+  # package ships the embedded driver co-installers, so no Windows WDK is needed.
+  wdi-simple-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Set up MSYS2 (mingw64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-libwdi
+
+      - name: Build wdi-simple.exe against packaged libwdi
+        run: |
+          set -euxo pipefail
+          # wdi-simple.c is libwdi's example CLI; build it against the installed lib.
+          git clone --depth 1 https://github.com/pbatard/libwdi /tmp/libwdi
+          mkdir -p dist/wdi-simple-windows-amd64
+          gcc /tmp/libwdi/examples/wdi-simple.c -o dist/wdi-simple-windows-amd64/wdi-simple.exe \
+            $(pkg-config --cflags --libs libwdi) -lsetupapi -lole32
+          ldd dist/wdi-simple-windows-amd64/wdi-simple.exe \
+            | awk '/\/mingw64\/bin\// {print $3}' \
+            | while read -r dll; do cp -v "$dll" dist/wdi-simple-windows-amd64/; done
+          ./dist/wdi-simple-windows-amd64/wdi-simple.exe --help || true
+          ls -la dist/wdi-simple-windows-amd64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdi-simple-windows-amd64
+          path: dist/wdi-simple-windows-amd64
+          if-no-files-found: error
