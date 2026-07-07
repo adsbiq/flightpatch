@@ -16,6 +16,22 @@ index 97b82e4..509a891 100644
  add_library (dumpvdl2_base OBJECT
  	acars.c
  	ac_data.c
+diff --git a/src/fmtr-text.c b/src/fmtr-text.c
+index 944ca5c..2e764f4 100644
+--- a/src/fmtr-text.c
++++ b/src/fmtr-text.c
+@@ -31,7 +31,10 @@ static bool fmtr_text_supports_data_type(fmtr_input_type_t type) {
+ }
+ 
+ static la_vstring *format_timestamp(struct timeval tv) {
+-	struct tm *tmstruct = (Config.utc == true ? gmtime(&tv.tv_sec) : localtime(&tv.tv_sec));
++	// Use a real time_t: on LLP64 (mingw) struct timeval.tv_sec is 32-bit long,
++	// so &tv.tv_sec is not a time_t* and gmtime()/localtime() reject it.
++	time_t tv_secs = tv.tv_sec;
++	struct tm *tmstruct = (Config.utc == true ? gmtime(&tv_secs) : localtime(&tv_secs));
+ 
+ 	char tbuf[30], tzbuf[8];
+ 	strftime(tbuf, sizeof(tbuf), "%F %T", tmstruct);
 diff --git a/src/output-udp.c b/src/output-udp.c
 index 1effb12..3a21071 100644
 --- a/src/output-udp.c
