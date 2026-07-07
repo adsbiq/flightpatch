@@ -1,0 +1,14 @@
+# build output
+*.exe
+adsbiq-feed-agent
+adsbiq-feed-agent-*
+dist/
+# tool downloads / decoder binaries (fetched by the installer, not committed)
+tools/
+*.dll
+*.zip
+# go
+/agent/bin/
+# editor / os
+.DS_Store
+Thumbs.db
