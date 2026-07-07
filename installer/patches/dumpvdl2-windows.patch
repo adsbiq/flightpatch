@@ -1,15 +1,16 @@
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 97b82e4..509a891 100644
+index 97b82e4..74847b6 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -262,6 +262,13 @@ add_custom_command(
+@@ -262,6 +262,14 @@ add_custom_command(
  add_subdirectory (asn1)
  add_subdirectory (libfec)
  
 +if(WIN32)
-+	# Force-include the POSIX/GNU compatibility shim into every dumpvdl2 TU and
-+	# link Winsock for the UDP output.
++	# Force-include the POSIX/GNU compatibility shim into every dumpvdl2 TU,
++	# add shim headers (e.g. <arpa/inet.h>), and link Winsock for socket I/O.
 +	add_compile_options(-include ${CMAKE_CURRENT_SOURCE_DIR}/win_compat.h)
++	include_directories(${CMAKE_CURRENT_SOURCE_DIR}/win_shim)
 +	list(APPEND dumpvdl2_extra_libs ws2_32)
 +endif()
 +
@@ -72,10 +73,10 @@ index 1effb12..3a21071 100644
  	char *port;
 diff --git a/src/win_compat.h b/src/win_compat.h
 new file mode 100644
-index 0000000..58371aa
+index 0000000..32fdcf8
 --- /dev/null
 +++ b/src/win_compat.h
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,81 @@
 +/*
 + * Windows / MinGW compatibility shim for dumpvdl2.
 + *
@@ -87,6 +88,14 @@ index 0000000..58371aa
 +#ifndef DUMPVDL2_WIN_COMPAT_H
 +#define DUMPVDL2_WIN_COMPAT_H
 +#ifdef _WIN32
++
++/* Winsock must precede any <windows.h> (glib pulls it in). Force-including this
++ * header first guarantees the order and provides ntohs/ntohl/htons everywhere. */
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <winsock2.h>
++#include <ws2tcpip.h>
 +
 +#include <signal.h>
 +#include <string.h>
@@ -149,3 +158,20 @@ index 0000000..58371aa
 +
 +#endif /* _WIN32 */
 +#endif /* DUMPVDL2_WIN_COMPAT_H */
+diff --git a/src/win_shim/arpa/inet.h b/src/win_shim/arpa/inet.h
+new file mode 100644
+index 0000000..7990b7e
+--- /dev/null
++++ b/src/win_shim/arpa/inet.h
+@@ -0,0 +1,11 @@
++/*
++ * Shim for <arpa/inet.h> on Windows/mingw.
++ *
++ * dumpvdl2 includes <arpa/inet.h> only for the byte-order helpers
++ * (ntohs/ntohl/htons), which Winsock already provides. win_compat.h force-
++ * includes <winsock2.h> ahead of everything, so this stub just satisfies the
++ * include and adds nothing.
++ */
++#ifndef DUMPVDL2_SHIM_ARPA_INET_H
++#define DUMPVDL2_SHIM_ARPA_INET_H
++#endif
