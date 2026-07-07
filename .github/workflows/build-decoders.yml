@@ -152,6 +152,8 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
+      - uses: actions/checkout@v4   # for installer/patches/dump1090-mingw.patch
+
       - name: Set up MSYS2 (mingw64)
         uses: msys2/setup-msys2@v2
         with:

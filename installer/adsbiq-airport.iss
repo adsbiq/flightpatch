@@ -30,6 +30,9 @@ OutputBaseFilename=adsbiq-airport-setup-{#AppVer}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+; Flightpatch splash art (164x314 + 328x628 hi-DPI); Inno picks by monitor DPI.
+WizardImageFile=assets\wizard-164x314.bmp,assets\wizard-328x628.bmp
+WizardImageStretch=no
 ; driver install + service registration require elevation
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64compatible
