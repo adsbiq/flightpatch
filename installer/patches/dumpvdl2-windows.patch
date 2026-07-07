@@ -73,10 +73,10 @@ index 1effb12..3a21071 100644
  	char *port;
 diff --git a/src/win_compat.h b/src/win_compat.h
 new file mode 100644
-index 0000000..32fdcf8
+index 0000000..efec7ff
 --- /dev/null
 +++ b/src/win_compat.h
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,91 @@
 +/*
 + * Windows / MinGW compatibility shim for dumpvdl2.
 + *
@@ -100,6 +100,7 @@ index 0000000..32fdcf8
 +#include <signal.h>
 +#include <string.h>
 +#include <stdlib.h>
++#include <time.h>
 +
 +/* --- POSIX signals: Windows lacks sigaction and several signal numbers --- */
 +#ifndef SIGHUP
@@ -155,6 +156,15 @@ index 0000000..32fdcf8
 +	return out;
 +}
 +#define strndup(s, n) compat_strndup((s), (n))
++
++/* --- POSIX reentrant time functions: Windows only has the *_s variants,
++       which take (dest, src) in the opposite order. --- */
++static inline struct tm *gmtime_r(const time_t *timep, struct tm *result) {
++	return (gmtime_s(result, timep) == 0) ? result : NULL;
++}
++static inline struct tm *localtime_r(const time_t *timep, struct tm *result) {
++	return (localtime_s(result, timep) == 0) ? result : NULL;
++}
 +
 +#endif /* _WIN32 */
 +#endif /* DUMPVDL2_WIN_COMPAT_H */
