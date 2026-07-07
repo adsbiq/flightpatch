@@ -82,6 +82,15 @@ var
 
 procedure InitializeWizard;
 begin
+  // Make the dongle timing impossible to miss — the driver only binds to a
+  // dongle that's connected during setup.
+  CreateOutputMsgPage(wpWelcome,
+    'Plug in your dongle',
+    'Connect your RTL-SDR receiver now',
+    'Before you continue, plug your RTL-SDR dongle into a USB port on this computer.' + #13#10 + #13#10 +
+    'Setup installs the dongle''s driver, so it needs to be connected right now — otherwise it won''t be able to feed.' + #13#10 + #13#10 +
+    'No dongle yet? You can close Setup and simply run it again once your dongle is plugged in.');
+
   OrgPage := CreateInputQueryPage(wpSelectDir,
     'Name your airfield (optional)',
     'Put your flight school or FBO on the map.',
