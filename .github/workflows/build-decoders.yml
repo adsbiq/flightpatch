@@ -142,3 +142,35 @@ jobs:
           name: wdi-simple-windows-amd64
           path: dist/wdi-simple-windows-amd64
           if-no-files-found: error
+
+  # ADS-B (1090) decoder. gvanem/Dump1090 is a Windows-native fork with librtlsdr
+  # built in, so it builds with CMake + VS2022 (on the runner) — no port needed.
+  dump1090-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout gvanem/Dump1090
+        shell: bash
+        run: git clone --depth 1 https://github.com/gvanem/Dump1090 dump1090src
+
+      - name: Configure + build (CMake, VS2022 x64)
+        shell: pwsh
+        run: |
+          cmake -S dump1090src -B dump1090src/build -G "Visual Studio 17 2022" -A x64
+          cmake --build dump1090src/build --config Release
+
+      - name: Collect exe + runtime DLLs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist/dump1090-windows-amd64
+          find dump1090src/build -name 'dump1090.exe' -exec cp -v {} dist/dump1090-windows-amd64/ \;
+          find dump1090src/build -name '*.dll' -exec cp -v {} dist/dump1090-windows-amd64/ \; || true
+          test -f dist/dump1090-windows-amd64/dump1090.exe
+          ls -la dist/dump1090-windows-amd64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dump1090-windows-amd64
+          path: dist/dump1090-windows-amd64
+          if-no-files-found: error
