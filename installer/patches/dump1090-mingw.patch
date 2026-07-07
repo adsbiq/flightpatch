@@ -1,0 +1,47 @@
+diff --git a/winstubs.h b/winstubs.h
+index f3ab63f..da6a24a 100644
+--- a/winstubs.h
++++ b/winstubs.h
+@@ -41,6 +41,11 @@
+ #include <windows.h>
+ #include <basetsd.h>
+ 
++#ifdef __MINGW32__
++#include <stdint.h>
++#include <sys/types.h>
++#include <unistd.h>
++#else
+ typedef UCHAR    uint8_t;
+ typedef USHORT   uint16_t;
+ typedef UINT32   uint32_t;
+@@ -48,6 +53,7 @@ typedef UINT64   uint64_t;
+ typedef UINT32   mode_t;
+ typedef long     ssize_t;
+ typedef int      socklen_t;
++#endif
+ 
+ #include <stdio.h>
+ #include <time.h>
+@@ -65,16 +71,20 @@ typedef int      socklen_t;
+ extern "C" {
+ #endif
+ 
++#ifndef __MINGW32__
+ //Functions not included in the MSVC maths library. This will do for our use.
+ _inline double round(double d) {return floor(d + 0.5);}
+ _inline double trunc(double d) {return (d>0) ? floor(d):ceil(d) ;}
+ 
+ //usleep works in microseconds, and isn't supported in Windows. This will do for our use.
+-_inline void usleep(UINT32 ulSleep) {Sleep(ulSleep/1000);} 
++_inline void usleep(UINT32 ulSleep) {Sleep(ulSleep/1000);}
+ _inline uint64_t strtoll(const char *p, void *e, UINT32 base) {return _atoi64(p);}
+-_inline int inet_aton(const char * cp, DWORD * ulAddr) { *ulAddr = inet_addr(cp); return (INADDR_NONE != *ulAddr);} 
++#endif
++_inline int inet_aton(const char * cp, DWORD * ulAddr) { *ulAddr = inet_addr(cp); return (INADDR_NONE != *ulAddr);}
++#ifndef __MINGW32__
+ #define snprintf  _snprintf
+ #define vsnprintf _vsnprintf
++#endif
+ #define realpath(N,R) _fullpath((R),(N),_MAX_PATH)
+ 
+ _inline void cls() {

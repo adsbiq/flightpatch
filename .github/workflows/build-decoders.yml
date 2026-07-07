@@ -168,7 +168,10 @@ jobs:
       - name: Build MalcolmRobb/dump1090 (Beast, RTL-SDR)
         run: |
           set -euxo pipefail
+          PATCH="$(pwd)/installer/patches/dump1090-mingw.patch"
           git clone --depth 1 https://github.com/MalcolmRobb/dump1090 /tmp/dump1090
+          # winstubs.h redefines types modern mingw provides — guard them to MSVC.
+          git -C /tmp/dump1090 apply --ignore-whitespace --verbose "$PATCH"
           cd /tmp/dump1090
           # Link Winsock for the _WIN32 network code.
           make dump1090 CFLAGS="$(pkg-config --cflags librtlsdr) -DMISSING_GETTIMEOFDAY" \
