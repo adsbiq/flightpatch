@@ -84,8 +84,9 @@ Register a device and run it against a local decoder:
 ## Status
 The feed agent is working and tested end-to-end: registration, live feeding, and remote
 management (enable/disable, restart, auto-update) all verified against the production network.
-VDL2 (second-dongle) decoding and the one-click installer (silent driver + bundled decoders)
-are in progress.
+The **VDL2 (second-dongle) decoder now builds for Windows** — CI produces `dumpvdl2.exe`
+plus its runtime DLLs — and has been proven end-to-end from a real dongle through the
+network. The one-click installer (silent driver + bundled decoders) is in progress.
 
 ## Links
 - Live map: [adsbiq.com/airport](https://adsbiq.com/airport)
