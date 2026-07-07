@@ -155,7 +155,7 @@ jobs:
       - name: Configure + build (CMake, VS2022 x64)
         shell: pwsh
         run: |
-          cmake -S dump1090src -B dump1090src/build -G "Visual Studio 17 2022" -A x64
+          cmake -S dump1090src/src -B dump1090src/build -G "Visual Studio 17 2022" -A x64
           cmake --build dump1090src/build --config Release
 
       - name: Collect exe + runtime DLLs
