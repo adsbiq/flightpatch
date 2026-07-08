@@ -10,6 +10,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
@@ -24,6 +25,15 @@ import (
 	"time"
 )
 
+// Role probe windows. VDL2 is listened to FIRST and for longer because a decoded
+// VDL2 frame is DEFINITIVE (a ~7cm 1090 antenna cannot hear 136 MHz), while it is
+// sparse so it needs a generous window. ADS-B is only the fallback: 1090 is so
+// strong it leaks into any antenna, so its mere presence proves nothing.
+const (
+	probeVDL2Window = 90 * time.Second
+	probeADSBWindow = 12 * time.Second
+)
+
 // Roles a dongle can be assigned.
 const (
 	RoleADSB = "adsb"
@@ -36,6 +46,18 @@ type Dongle struct {
 	Index   int
 	Serial  string
 	Product string
+	Port    string // USB bus-port path — stable + unique even when serials collide
+}
+
+// key is the stable, per-physical-device identifier the supervisor tracks a
+// dongle by. The USB port is unique even when two identical dongles share a
+// serial (all V4s report "BLOGV4"); we fall back to serial only if the port is
+// unavailable. This is Plan A — collisions are handled with zero EEPROM writes.
+func (d Dongle) key() string {
+	if d.Port != "" {
+		return d.Port
+	}
+	return d.Serial
 }
 
 type roleAssignment struct {
@@ -122,7 +144,7 @@ func (m *DecoderManager) run(parent context.Context) {
 		cancel context.CancelFunc
 		role   string
 	}
-	active := map[string]child{} // by dongle serial
+	active := map[string]child{} // keyed by dongle key() (USB port -> unique)
 	var fwdCancel context.CancelFunc
 
 	stopAll := func() {
@@ -156,20 +178,20 @@ func (m *DecoderManager) run(parent context.Context) {
 		seen := map[string]bool{}
 		wantForward := false
 		for _, a := range assigns {
-			seen[a.Dongle.Serial] = true
+			seen[a.Dongle.key()] = true
 			if a.Role == RoleADSB {
 				wantForward = true
 			}
 			if a.Role == RoleOff {
 				continue
 			}
-			if _, ok := active[a.Dongle.Serial]; ok {
+			if _, ok := active[a.Dongle.key()]; ok {
 				continue // already running
 			}
 			dctx, dcancel := context.WithCancel(parent)
-			active[a.Dongle.Serial] = child{dcancel, a.Role}
+			active[a.Dongle.key()] = child{dcancel, a.Role}
 			go m.superviseDecoder(dctx, a.Role, a.Dongle)
-			log.Printf("decoder scheduled: role=%s dongle=#%d serial=%s", a.Role, a.Dongle.Index, a.Dongle.Serial)
+			log.Printf("decoder scheduled: role=%s dongle=#%d serial=%s port=%s", a.Role, a.Dongle.Index, a.Dongle.Serial, a.Dongle.Port)
 		}
 		// stop decoders whose dongle was unplugged
 		for s, c := range active {
@@ -219,12 +241,14 @@ func (m *DecoderManager) run(parent context.Context) {
 // probe to tell 1090 antennas from VHF ones. Results are persisted so probing
 // happens at most once per dongle.
 func (m *DecoderManager) assignRoles(ctx context.Context, dongles []Dongle) []roleAssignment {
+	// Plan A: decoders are keyed by USB port (Dongle.key()), so identical
+	// serials no longer collide -- no EEPROM re-serialization needed.
 	_, adsbAvail := exePath(m.cfg.DecoderDir, adsbExeName())
 	_, vdl2Avail := exePath(m.cfg.DecoderDir, vdl2ExeName())
 
 	out := make([]roleAssignment, 0, len(dongles))
 	for _, d := range dongles {
-		role := m.cfg.roleFor(d.Serial)
+		role := m.cfg.roleFor(d.key())
 		switch {
 		case role != "":
 			// keep configured role
@@ -233,15 +257,11 @@ func (m *DecoderManager) assignRoles(ctx context.Context, dongles []Dongle) []ro
 		case vdl2Avail && !adsbAvail:
 			role = RoleVDL2
 		case adsbAvail && vdl2Avail:
-			if m.probeADSB(ctx, d) {
-				role = RoleADSB
-			} else {
-				role = RoleVDL2
-			}
+			role = m.probeRole(ctx, d)
 		default:
 			role = RoleOff // no decoders bundled
 		}
-		if role != RoleOff && m.cfg.setRole(d.Serial, role) {
+		if role != RoleOff && m.cfg.setRole(d.key(), role) {
 			_ = m.cfg.Save()
 		}
 		out = append(out, roleAssignment{Dongle: d, Role: role})
@@ -249,38 +269,150 @@ func (m *DecoderManager) assignRoles(ctx context.Context, dongles []Dongle) []ro
 	return out
 }
 
-// probeADSB briefly runs the ADS-B decoder on a dedicated Beast port and checks
-// whether any frames arrive — true means a 1090 antenna is attached.
-func (m *DecoderManager) probeADSB(ctx context.Context, d Dongle) bool {
+// dedupeSerials ensures every dongle has a UNIQUE usb serial. Generic dongles
+// ship with a fixed serial (all RTL-SDR Blog V4s report "BLOGV4", all cheap
+// dongles "00000001"), so two of the same model COLLIDE — and the supervisor
+// keys running decoders by serial, so a collision would silently run only one.
+// When we see a duplicate we write a unique serial to the later dongle (EEPROM)
+// and re-enumerate so each is tracked independently. One-time per dongle;
+// idempotent thereafter (distinct serials -> no writes).
+func (m *DecoderManager) dedupeSerials(dongles []Dongle) []Dongle {
+	seen := map[string]bool{}
+	changed := false
+	for _, d := range dongles {
+		if !seen[d.Serial] {
+			seen[d.Serial] = true
+			continue
+		}
+		ns := uniqueSerial(seen)
+		if err := writeDongleSerial(m.cfg.DecoderDir, d.Index, ns); err != nil {
+			log.Printf("dedupe: dongle #%d duplicate serial %q; re-serial failed: %v", d.Index, d.Serial, err)
+			seen[d.Serial] = true // don't spin; it stays a duplicate (degraded)
+			continue
+		}
+		log.Printf("dedupe: dongle #%d had duplicate serial %q; rewrote to %q", d.Index, d.Serial, ns)
+		seen[ns] = true
+		changed = true
+	}
+	if changed {
+		// A written serial only goes live after re-enumeration — cycle the USB
+		// devices (needs elevation: install-time or the SYSTEM service).
+		log.Printf("dedupe: cycling RTL-SDR devices so new serials take effect...")
+		resetRtlDevices()
+		return enumerateDongles(m.cfg.DecoderDir)
+	}
+	return dongles
+}
+
+// uniqueSerial returns the first "ADSBIQNNN" serial not already taken.
+func uniqueSerial(taken map[string]bool) string {
+	for i := 1; i < 100000; i++ {
+		s := fmt.Sprintf("ADSBIQ%03d", i)
+		if !taken[s] {
+			return s
+		}
+	}
+	return "ADSBIQ000"
+}
+
+// probeRole decides a dongle's role by LISTENING, in the correct order: VDL2
+// first (a decode is definitive — a ~7cm 1090 antenna cannot hear 136 MHz), then
+// ADS-B as the fallback (ubiquitous 1090 leaks into ANY antenna, so its mere
+// presence is not proof of a 1090 antenna). The result is persisted by the caller
+// so the probe runs at most once per dongle.
+func (m *DecoderManager) probeRole(ctx context.Context, d Dongle) string {
+	if heard, n := m.probeVDL2(ctx, d, probeVDL2Window); heard {
+		log.Printf("probe dongle #%d (%s): VDL2 confirmed (%d decoded lines) -> vdl2", d.Index, d.Serial, n)
+		return RoleVDL2
+	}
+	b := m.probeADSBBytes(ctx, d, probeADSBWindow)
+	rate := float64(b) / probeADSBWindow.Seconds()
+	log.Printf("probe dongle #%d (%s): no VDL2; ADS-B ~%.0f B/s -> adsb", d.Index, d.Serial, rate)
+	return RoleADSB
+}
+
+// probeVDL2 runs the VDL2 decoder to stdout for `window` and returns whether any
+// frame decoded (plus the line count). One CRC-valid VDL2 frame proves a 136 MHz
+// antenna is attached.
+func (m *DecoderManager) probeVDL2(ctx context.Context, d Dongle, window time.Duration) (bool, int) {
+	exe, ok := exePath(m.cfg.DecoderDir, vdl2ExeName())
+	if !ok {
+		return false, 0
+	}
+	pctx, cancel := context.WithTimeout(ctx, window+8*time.Second)
+	defer cancel()
+	args := []string{"--rtlsdr", strconv.Itoa(d.Index), "--gain", m.cfg.Gain,
+		"--output", "decoded:text:file:path=-"}
+	args = append(args, m.cfg.VDL2Freqs...)
+	cmd := exec.CommandContext(pctx, exe, args...)
+	configureChild(cmd)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return false, 0
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("probe: cannot start VDL2 decoder: %v", err)
+		return false, 0
+	}
+	assignChildToJob(cmd)
+	lines := 0
+	done := make(chan struct{})
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		sc.Buffer(make([]byte, 64*1024), 1024*1024)
+		for sc.Scan() {
+			if strings.TrimSpace(sc.Text()) != "" {
+				lines++
+			}
+		}
+		close(done)
+	}()
+	select {
+	case <-time.After(window):
+	case <-pctx.Done():
+	}
+	cancel()
+	_ = cmd.Wait()
+	<-done
+	return lines > 0, lines
+}
+
+// probeADSBBytes runs the ADS-B decoder on a dedicated Beast port for `window`
+// and returns how many Beast bytes arrived. A resonant 1090 antenna yields a
+// steady stream; a non-1090 antenna yields at most a weak trickle.
+func (m *DecoderManager) probeADSBBytes(ctx context.Context, d Dongle, window time.Duration) int {
 	exe, ok := exePath(m.cfg.DecoderDir, adsbExeName())
 	if !ok {
-		return false
+		return 0
 	}
-	pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	pctx, cancel := context.WithTimeout(ctx, window+10*time.Second)
 	defer cancel()
-	// Probe on a dedicated Beast port so it can't collide with a real decoder.
-	const probePort = "31005"
+	const probePort = "31005" // dedicated so it can't collide with a real decoder
 	cmd := exec.CommandContext(pctx, exe, "--device-index", strconv.Itoa(d.Index),
 		"--net", "--net-beast", "--net-bo-port", probePort)
 	configureChild(cmd)
 	if err := cmd.Start(); err != nil {
 		log.Printf("probe: cannot start ADS-B decoder: %v", err)
-		return false
+		return 0
 	}
+	assignChildToJob(cmd)
 	defer func() { _ = cmd.Wait() }()
-	time.Sleep(3 * time.Second) // let it bind + tune
-	got := false
+	time.Sleep(4 * time.Second) // let it bind + tune
+	total := 0
 	if c, err := net.DialTimeout("tcp", "127.0.0.1:"+probePort, 3*time.Second); err == nil {
-		_ = c.SetReadDeadline(time.Now().Add(9 * time.Second))
-		buf := make([]byte, 64)
-		if n, _ := c.Read(buf); n > 0 {
-			got = true
+		_ = c.SetReadDeadline(time.Now().Add(window))
+		buf := make([]byte, 8192)
+		for {
+			n, rerr := c.Read(buf)
+			total += n
+			if rerr != nil {
+				break
+			}
 		}
 		c.Close()
 	}
 	cancel()
-	log.Printf("probe dongle #%d (%s): ADS-B %s", d.Index, d.Serial, map[bool]string{true: "detected", false: "not detected"}[got])
-	return got
+	return total
 }
 
 // superviseDecoder runs the decoder for a role, restarting it (with backoff)
@@ -310,6 +442,7 @@ func (m *DecoderManager) superviseDecoder(ctx context.Context, role string, d Do
 			continue
 		}
 		niceChild(cmd.Process.Pid)
+		assignChildToJob(cmd)
 		log.Printf("%s decoder running (pid %d, dongle #%d %s)", role, cmd.Process.Pid, d.Index, d.Serial)
 		_ = cmd.Wait()
 		if ctx.Err() != nil {

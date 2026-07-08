@@ -12,16 +12,20 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
 
 // Version is stamped into telemetry and drives auto-update comparisons.
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 func platformString() string { return runtime.GOOS + "/" + runtime.GOARCH }
 
@@ -34,6 +38,14 @@ func main() {
 		local      = flag.String("local", "", "local decoder Beast host:port (default 127.0.0.1:30005)")
 		decoderDir = flag.String("decoders", "", "directory holding the decoder binaries (default: agent dir)")
 		once       = flag.Bool("register-only", false, "register, print identity, and exit")
+		probeOnly  = flag.Bool("probe-only", false, "enumerate dongles, probe each role, print, and exit (no register/feed)")
+		eepromDump = flag.Bool("eeprom-dump", false, "read + back up + print dongle 0's EEPROM, then exit (read-only diagnostic)")
+		watch      = flag.Bool("watch", false, "log dongle enumeration changes every 2s (hot-plug demo; no register/feed)")
+		eepromTest = flag.Int("eeprom-selftest", -1, "reversible EEPROM write test on the given dongle index, then exit")
+		setSerial  = flag.String("set-serial", "", "diagnostic/repair: write a dongle serial, e.g. --set-serial 1=ADSBIQ001, then exit")
+		dedupe     = flag.Bool("dedupe", false, "diagnostic: enumerate, de-duplicate colliding serials, print, and exit")
+		resetUSB   = flag.Bool("reset-usb", false, "diagnostic: cycle RTL-SDR USB devices (needs elevation) so EEPROM serial writes take effect, then exit")
+		jobTest    = flag.Bool("job-test", false, "diagnostic: spawn a child in the kill-on-close job then exit; the child must die with us (no orphans)")
 	)
 	flag.Parse()
 
@@ -52,6 +64,98 @@ func main() {
 	}
 	if *email != "" {
 		cfg.UserEmail = *email
+	}
+
+	if *eepromDump {
+		if err := dumpEEPROM(cfg.DecoderDir); err != nil {
+			log.Fatalf("eeprom dump: %v", err)
+		}
+		return
+	}
+
+	if *eepromTest >= 0 {
+		if err := eepromSelfTest(cfg.DecoderDir, *eepromTest); err != nil {
+			log.Fatalf("eeprom selftest: %v", err)
+		}
+		return
+	}
+
+	if *setSerial != "" {
+		parts := strings.SplitN(*setSerial, "=", 2)
+		if len(parts) != 2 {
+			log.Fatalf("--set-serial expects idx=serial (e.g. 1=ADSBIQ001)")
+		}
+		idx, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil {
+			log.Fatalf("--set-serial bad index: %v", err)
+		}
+		if err := writeDongleSerial(cfg.DecoderDir, idx, strings.TrimSpace(parts[1])); err != nil {
+			log.Fatalf("set-serial: %v", err)
+		}
+		log.Printf("dongle #%d serial set to %q", idx, strings.TrimSpace(parts[1]))
+		return
+	}
+
+	if *jobTest {
+		cmd := exec.Command("ping", "-n", "60", "127.0.0.1") // ~60s child
+		configureChild(cmd)
+		if err := cmd.Start(); err != nil {
+			log.Fatalf("job-test: start child: %v", err)
+		}
+		assignChildToJob(cmd)
+		log.Printf("job-test: spawned child pid %d in kill-on-close job; exiting now — it must die with us", cmd.Process.Pid)
+		return
+	}
+
+	if *resetUSB {
+		log.Printf("cycling RTL-SDR USB devices...")
+		resetRtlDevices()
+		for _, d := range enumerateDongles(cfg.DecoderDir) {
+			log.Printf("after reset: #%d serial=%q %q", d.Index, d.Serial, d.Product)
+		}
+		return
+	}
+
+	if *dedupe {
+		mgr := newDecoderManager(cfg, &Stats{start: time.Now()})
+		for _, d := range enumerateDongles(cfg.DecoderDir) {
+			log.Printf("before: #%d serial=%q %q", d.Index, d.Serial, d.Product)
+		}
+		for _, d := range mgr.dedupeSerials(enumerateDongles(cfg.DecoderDir)) {
+			log.Printf("after:  #%d serial=%q %q", d.Index, d.Serial, d.Product)
+		}
+		return
+	}
+
+	if *watch {
+		log.Printf("watch: polling every 2s; plug/unplug dongles to see changes (kill to stop)")
+		prev := ""
+		for {
+			ds := enumerateDongles(cfg.DecoderDir)
+			cur := ""
+			for _, d := range ds {
+				cur += fmt.Sprintf("[#%d serial=%q port=%q %q] ", d.Index, d.Serial, d.Port, d.Product)
+			}
+			if cur != prev {
+				log.Printf("dongles(%d): %s", len(ds), cur)
+				prev = cur
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	// Diagnostic: enumerate + probe roles against real hardware, then exit.
+	// Never registers or feeds — safe to run any time to see what the agent sees.
+	if *probeOnly {
+		dongles := enumerateDongles(cfg.DecoderDir)
+		log.Printf("probe-only: enumerated %d dongle(s); decoders in %s", len(dongles), cfg.DecoderDir)
+		mgr := newDecoderManager(cfg, &Stats{start: time.Now()})
+		for _, d := range dongles {
+			log.Printf("dongle #%d serial=%q product=%q", d.Index, d.Serial, d.Product)
+			role := mgr.probeRole(context.Background(), d)
+			log.Printf("  => role=%s", role)
+		}
+		return
 	}
 
 	// Register once (or whenever the token is missing).

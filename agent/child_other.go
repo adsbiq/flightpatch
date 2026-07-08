@@ -18,3 +18,7 @@ func configureChild(cmd *exec.Cmd) {
 func niceChild(pid int) {
 	_ = syscall.Setpriority(syscall.PRIO_PROCESS, pid, 19)
 }
+
+// assignChildToJob is a no-op off Windows — Setpgid (above) already lets the
+// process group be killed together.
+func assignChildToJob(cmd *exec.Cmd) { _ = cmd }

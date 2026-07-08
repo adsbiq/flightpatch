@@ -10,9 +10,9 @@
 ; assemble them from the CI artifacts. Compile with: iscc flightpatch.iss
 
 #define AppName "Flightpatch"
-#define AppVer "0.3.0"
+#define AppVer "0.4.0"
 #define AppPublisher "ADSBiq"
-#define AppURL "https://adsbiq.com/airport"
+#define AppURL "https://flightpatch.app/airport"
 ; RTL2832U (all RTL-SDR dongles): USB VID 0x0BDA, PID 0x2838
 #define RtlVid "0x0BDA"
 #define RtlPid "0x2838"
@@ -41,7 +41,7 @@ UninstallDisplayName={#AppName}
 
 [Messages]
 ; Onboarding copy — plain language, no jargon. (See PRODUCT_UX.md for the full spec.)
-WelcomeLabel2=In about a minute, your airfield goes live at adsbiq.com/airport — every takeoff, landing, and pattern, in real time.%n%nWe'll set up your dongle and start feeding automatically. No Raspberry Pi, no config, no hassle.
+WelcomeLabel2=In about a minute, your airfield goes live at flightpatch.app/airport — every takeoff, landing, and pattern, in real time.%n%nWe'll set up your dongle and start feeding automatically. No Raspberry Pi, no config, no hassle.
 FinishedHeadingLabel=You're live! 🎉
 FinishedLabelNoIcons=Your airfield is now feeding the ADSBiq network. Aircraft may take a minute to appear on the map.
 FinishedLabel=Your airfield is now feeding the ADSBiq network. Aircraft may take a minute to appear on the map.
@@ -70,7 +70,7 @@ Filename: "{app}\driver\wdi-simple.exe"; \
 Filename: "{app}\service\adsbiq-service.exe"; Parameters: "install"; Flags: runhidden waituntilterminated
 Filename: "{app}\service\adsbiq-service.exe"; Parameters: "start"; Flags: runhidden waituntilterminated
 ; 3) offer to open the live map
-Filename: "{#AppURL}"; Description: "Open the ADSBiq live map"; Flags: postinstall shellexec nowait
+Filename: "{#AppURL}"; Description: "Open my live airfield map"; Flags: postinstall shellexec nowait
 
 [UninstallRun]
 Filename: "{app}\service\adsbiq-service.exe"; Parameters: "stop"; Flags: runhidden waituntilterminated; RunOnceId: "StopSvc"

@@ -5,27 +5,47 @@ package main
 import (
 	"log"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"unsafe"
 )
 
+// librtlsdr is loaded exactly ONCE and its procs cached — the supervisor
+// enumerates on a cadence, and re-LoadDLL'ing every scan leaked a module
+// reference each call (millions/year) for no benefit.
+var (
+	rtlOnce     sync.Once
+	rtlDLL      *syscall.DLL // cached handle so EEPROM ops can FindProc too
+	rtlGetCount *syscall.Proc
+	rtlGetStr   *syscall.Proc
+)
+
+func initRtlsdr(decoderDir string) {
+	rtlOnce.Do(func() {
+		if decoderDir != "" {
+			setDllDirectory(decoderDir)
+		}
+		dll := loadRtlsdr(decoderDir)
+		if dll == nil {
+			return
+		}
+		gc, err1 := dll.FindProc("rtlsdr_get_device_count")
+		gs, err2 := dll.FindProc("rtlsdr_get_device_usb_strings")
+		if err1 != nil || err2 != nil {
+			log.Printf("dongles: librtlsdr missing expected procs")
+			return
+		}
+		rtlDLL, rtlGetCount, rtlGetStr = dll, gc, gs
+	})
+}
+
 // enumerateDongles lists RTL-SDR devices via librtlsdr. The DLL and its
 // dependencies (libusb, winpthread) ship next to the agent, so we point the
-// loader at decoderDir first.
+// loader at decoderDir first (once).
 func enumerateDongles(decoderDir string) []Dongle {
-	if decoderDir != "" {
-		setDllDirectory(decoderDir)
-	}
-	dll := loadRtlsdr(decoderDir)
-	if dll == nil {
-		return nil
-	}
-	getCount, err := dll.FindProc("rtlsdr_get_device_count")
-	if err != nil {
-		return nil
-	}
-	getStrings, err := dll.FindProc("rtlsdr_get_device_usb_strings")
-	if err != nil {
+	initRtlsdr(decoderDir)
+	getCount, getStrings := rtlGetCount, rtlGetStr
+	if getCount == nil || getStrings == nil {
 		return nil
 	}
 
@@ -45,6 +65,14 @@ func enumerateDongles(decoderDir string) []Dongle {
 			Serial:  cstr(serial[:]),
 			Product: cstr(prod[:]),
 		})
+	}
+	// Attach the USB port path (unique per physical device even when serials
+	// collide). ports is indexed by librtlsdr device index.
+	ports := donglePorts(decoderDir)
+	for i := range out {
+		if out[i].Index >= 0 && out[i].Index < len(ports) {
+			out[i].Port = ports[out[i].Index]
+		}
 	}
 	return out
 }
