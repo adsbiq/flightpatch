@@ -32,12 +32,14 @@ import (
 const (
 	probeVDL2Window = 90 * time.Second
 	probeADSBWindow = 12 * time.Second
+	probeUATWindow  = 90 * time.Second // 978 UAT is US-only + sparse (thin GA), so a generous window
 )
 
 // Roles a dongle can be assigned.
 const (
 	RoleADSB = "adsb"
 	RoleVDL2 = "vdl2"
+	RoleUAT  = "uat" // 978 MHz UAT (US GA); requires Enable978 + a dump978 + readsb bundle
 	RoleOff  = "off"
 )
 
@@ -77,6 +79,23 @@ func vdl2ExeName() string {
 		return "dumpvdl2.exe"
 	}
 	return "dumpvdl2"
+}
+
+// readsbExeName is the full ADS-B decoder used for the 978 path: readsb is a dump1090
+// superset that can MERGE 978 UAT (pulled from dump978) into its Beast stream.
+func readsbExeName() string {
+	if runtime.GOOS == "windows" {
+		return "readsb.exe"
+	}
+	return "readsb"
+}
+
+// uat978ExeName is the 978 MHz UAT demodulator (dump978-fa, SoapySDR-based).
+func uat978ExeName() string {
+	if runtime.GOOS == "windows" {
+		return "dump978-fa.exe"
+	}
+	return "dump978-fa"
 }
 
 // exePath resolves a decoder binary: first next to the agent (DecoderDir), then
@@ -325,6 +344,15 @@ func (m *DecoderManager) probeRole(ctx context.Context, d Dongle) string {
 		log.Printf("probe dongle #%d (%s): VDL2 confirmed (%d decoded lines) -> vdl2", d.Index, d.Serial, n)
 		return RoleVDL2
 	}
+	// 978 UAT probe (opt-in). Like VDL2, a decoded UAT frame is definitive (1090 leakage
+	// can't fake it). BEST-EFFORT: 978/GA is sparse, so absence isn't proof — a 978 dongle
+	// may still fall through to ADS-B here; prefer explicit config/server role for it.
+	if m.cfg.Enable978 {
+		if heard, n := m.probeUAT(ctx, d, probeUATWindow); heard {
+			log.Printf("probe dongle #%d (%s): 978 UAT confirmed (%d frames) -> uat", d.Index, d.Serial, n)
+			return RoleUAT
+		}
+	}
 	b := m.probeADSBBytes(ctx, d, probeADSBWindow)
 	rate := float64(b) / probeADSBWindow.Seconds()
 	log.Printf("probe dongle #%d (%s): no VDL2; ADS-B ~%.0f B/s -> adsb", d.Index, d.Serial, rate)
@@ -375,6 +403,56 @@ func (m *DecoderManager) probeVDL2(ctx context.Context, d Dongle, window time.Du
 	_ = cmd.Wait()
 	<-done
 	return lines > 0, lines
+}
+
+// probeUAT runs the 978 UAT decoder (dump978) to stdout for `window` and returns whether
+// any UAT frame decoded. dump978 --raw-stdout emits one frame per line, prefixed '+' (uplink)
+// or '-' (downlink/aircraft). A decoded frame proves 978 reception (a 1090/VHF antenna can't
+// fake it). Only meaningful when Enable978 (dump978 bundled).
+func (m *DecoderManager) probeUAT(ctx context.Context, d Dongle, window time.Duration) (bool, int) {
+	exe, ok := exePath(m.cfg.DecoderDir, uat978ExeName())
+	if !ok {
+		return false, 0
+	}
+	pctx, cancel := context.WithTimeout(ctx, window+8*time.Second)
+	defer cancel()
+	dev := "driver=rtlsdr"
+	if d.Serial != "" {
+		dev = "driver=rtlsdr,serial=" + d.Serial
+	}
+	cmd := exec.CommandContext(pctx, exe, "--sdr", dev, "--sdr-auto-gain", "--raw-stdout")
+	cmd.Env = soapyEnv(m.cfg.DecoderDir)
+	configureChild(cmd)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return false, 0
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("probe: cannot start UAT decoder: %v", err)
+		return false, 0
+	}
+	assignChildToJob(cmd)
+	frames := 0
+	done := make(chan struct{})
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		sc.Buffer(make([]byte, 64*1024), 1024*1024)
+		for sc.Scan() {
+			t := strings.TrimSpace(sc.Text())
+			if len(t) > 1 && (t[0] == '+' || t[0] == '-') {
+				frames++
+			}
+		}
+		close(done)
+	}()
+	select {
+	case <-time.After(window):
+	case <-pctx.Done():
+	}
+	cancel()
+	_ = cmd.Wait()
+	<-done
+	return frames > 0, frames
 }
 
 // probeADSBBytes runs the ADS-B decoder on a dedicated Beast port for `window`
@@ -463,13 +541,42 @@ func (m *DecoderManager) superviseDecoder(ctx context.Context, role string, d Do
 func (m *DecoderManager) buildDecoderCmd(ctx context.Context, role string, d Dongle) (*exec.Cmd, error) {
 	switch role {
 	case RoleADSB:
+		// When 978 UAT is enabled AND readsb is bundled, use readsb (a dump1090 superset) so
+		// it can MERGE 978 UAT — pulled from dump978's :30978 via a uat_in connector — into the
+		// Beast stream. Otherwise the minimal dump1090. Either way Beast on :30005 → forwarder.
+		if m.cfg.Enable978 {
+			if exe, ok := exePath(m.cfg.DecoderDir, readsbExeName()); ok {
+				return exec.CommandContext(ctx, exe,
+					"--device-type", "rtlsdr", "--device", deviceSelector(d),
+					"--gain", "auto", // readsb autogain
+					"--net", "--net-bo-port", "30005",
+					"--net-connector", "127.0.0.1,30978,uat_in"), nil
+			}
+		}
 		exe, ok := exePath(m.cfg.DecoderDir, adsbExeName())
 		if !ok {
 			return nil, fmt.Errorf("%s not found in %s", adsbExeName(), m.cfg.DecoderDir)
 		}
 		// dump1090 serves Beast on :30005; the forwarder relays it to the network.
+		// --gain -10 = auto-gain (adsb.im default): avoids the fixed-max-gain overload that
+		// clips weak/distant aircraft. Configurable via AdsbGain.
 		return exec.CommandContext(ctx, exe, "--device-index", strconv.Itoa(d.Index),
+			"--gain", m.cfg.AdsbGain,
 			"--net", "--net-beast", "--net-bo-port", "30005"), nil
+	case RoleUAT:
+		exe, ok := exePath(m.cfg.DecoderDir, uat978ExeName())
+		if !ok {
+			return nil, fmt.Errorf("%s not found in %s", uat978ExeName(), m.cfg.DecoderDir)
+		}
+		// dump978 demodulates 978 UAT and serves raw messages on :30978; the ADS-B readsb
+		// pulls them (uat_in connector) and merges them into the Beast stream to :30004.
+		dev := "driver=rtlsdr"
+		if d.Serial != "" {
+			dev = "driver=rtlsdr,serial=" + d.Serial
+		}
+		cmd := exec.CommandContext(ctx, exe, "--sdr", dev, "--sdr-auto-gain", "--raw-port", "30978")
+		cmd.Env = soapyEnv(m.cfg.DecoderDir)
+		return cmd, nil
 	case RoleVDL2:
 		exe, ok := exePath(m.cfg.DecoderDir, vdl2ExeName())
 		if !ok {
@@ -490,6 +597,21 @@ func splitHostPort(hp string) (host, port string) {
 		return h, p
 	}
 	return hp, "5552"
+}
+
+// soapyEnv points SoapySDR at the bundled RTL-SDR plugin (dump978's runtime dependency,
+// dlopen'd not linked). The CI bundles the module under <DecoderDir>/soapymodules.
+func soapyEnv(decoderDir string) []string {
+	return append(os.Environ(), "SOAPY_SDR_PLUGIN_PATH="+filepath.Join(decoderDir, "soapymodules"))
+}
+
+// deviceSelector picks how readsb/dump978 select a dongle: by serial when known
+// (precise), else by index. (dump1090 uses --device-index directly.)
+func deviceSelector(d Dongle) string {
+	if d.Serial != "" {
+		return d.Serial
+	}
+	return strconv.Itoa(d.Index)
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {

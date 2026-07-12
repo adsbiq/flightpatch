@@ -1,0 +1,125 @@
+diff --git a/dump978_main.cc b/dump978_main.cc
+index 5e08dfd..8fbb514 100644
+--- a/dump978_main.cc
++++ b/dump978_main.cc
+@@ -7,7 +7,7 @@
+ #include <boost/asio/signal_set.hpp>
+ #include <boost/exception/diagnostic_information.hpp>
+ #include <boost/program_options.hpp>
+-#include <boost/regex.hpp>
++#include <regex>  // std::regex (was boost::regex; avoids the unbundled boost_regex lib on mingw)
+ 
+ #include <iostream>
+ #include <memory>
+@@ -38,9 +38,9 @@ void validate(boost::any &v, const std::vector<std::string> &values, listen_opti
+     po::validators::check_first_occurrence(v);
+     const std::string &s = po::validators::get_single_string(values);
+ 
+-    static const boost::regex r("(?:([^:]+):)?(\\d+)");
+-    boost::smatch match;
+-    if (boost::regex_match(s, match, r)) {
++    static const std::regex r("(?:([^:]+):)?(\\d+)");
++    std::smatch match;
++    if (std::regex_match(s, match, r)) {
+         listen_option o;
+         o.host = match[1];
+         o.port = match[2];
+@@ -138,7 +138,12 @@ static int realmain(int argc, char **argv) {
+     }
+ 
+     if (opts.count("stdin")) {
++#ifndef _WIN32
+         sample_source = StdinSampleSource::Create(io_context, opts);
++#else
++        std::cerr << "--stdin is not supported on Windows; use --sdr" << std::endl;
++        return EXIT_NO_RESTART;
++#endif
+     } else if (opts.count("file")) {
+         boost::filesystem::path path(opts["file"].as<std::string>());
+         sample_source = FileSampleSource::Create(io_context, path, opts);
+@@ -146,8 +151,13 @@ static int realmain(int argc, char **argv) {
+         auto device = opts["sdr"].as<std::string>();
+         sample_source = SoapySampleSource::Create(io_context, device, opts);
+     } else if (opts.count("stratuxv3")) {
++#ifndef _WIN32
+         auto path = opts["stratuxv3"].as<std::string>();
+         message_source = StratuxSerial::Create(io_context, path);
++#else
++        std::cerr << "--stratuxv3 is not supported on Windows; use --sdr" << std::endl;
++        return EXIT_NO_RESTART;
++#endif
+     } else {
+         assert("impossible case" && false);
+     }
+diff --git a/sample_source.cc b/sample_source.cc
+index 9f870df..4283090 100644
+--- a/sample_source.cc
++++ b/sample_source.cc
+@@ -12,7 +12,7 @@
+ using namespace flightaware::uat;
+ 
+ void FileSampleSource::Start() {
+-    stream_.open(path_.native());
++    stream_.open(path_.string()); // .native() is wstring on Windows; .string() is portable narrow
+     if (!stream_.good()) {
+         auto ec = boost::system::error_code(errno, boost::system::system_category());
+         stream_.close();
+@@ -89,6 +89,7 @@ void FileSampleSource::ReadBlock(const boost::system::error_code &ec) {
+ //
+ //
+ 
++#ifndef _WIN32  // StdinSampleSource uses boost::asio::posix + dup(STDIN_FILENO) — POSIX-only
+ void StdinSampleSource::Start() {
+     stream_.assign(::dup(STDIN_FILENO));
+     ScheduleRead();
+@@ -141,3 +142,4 @@ void StdinSampleSource::ScheduleRead() {
+         ScheduleRead();
+     });
+ }
++#endif // _WIN32
+diff --git a/sample_source.h b/sample_source.h
+index 5eb6ef7..5ea9504 100644
+--- a/sample_source.h
++++ b/sample_source.h
+@@ -13,7 +13,9 @@
+ #include <memory>
+ 
+ #include <boost/asio/io_context.hpp>
+-#include <boost/asio/posix/stream_descriptor.hpp>
++#ifndef _WIN32
++#include <boost/asio/posix/stream_descriptor.hpp>  // POSIX-only; stdin source unused on Windows
++#endif
+ #include <boost/asio/steady_timer.hpp>
+ #include <boost/filesystem.hpp>
+ #include <boost/program_options.hpp>
+@@ -98,6 +100,7 @@ namespace flightaware {
+         std::uint64_t timestamp_;
+     };
+ 
++#ifndef _WIN32  // StdinSampleSource needs boost::asio::posix (POSIX-only); unused on Windows
+     class StdinSampleSource : public SampleSource {
+       public:
+         static SampleSource::Pointer Create(boost::asio::io_context &service, const boost::program_options::variables_map &options, std::size_t samples_per_second = 2083333, std::size_t samples_per_block = 524288) { return Pointer(new StdinSampleSource(service, options, samples_per_second, samples_per_block)); }
+@@ -127,6 +130,7 @@ namespace flightaware {
+         Bytes block_;
+         std::size_t used_;
+     };
++#endif // _WIN32
+   }; // namespace flightaware::uat
+ };   // namespace flightaware
+ 
+diff --git a/stratux_serial.h b/stratux_serial.h
+index dd2b298..d4e707b 100644
+--- a/stratux_serial.h
++++ b/stratux_serial.h
+@@ -13,7 +13,9 @@
+ #include <memory>
+ 
+ #include <boost/asio/io_context.hpp>
+-#include <boost/asio/posix/stream_descriptor.hpp>
++#ifndef _WIN32
++#include <boost/asio/posix/stream_descriptor.hpp>  // unused (class uses serial_port); POSIX-only header
++#endif
+ #include <boost/asio/serial_port.hpp>
+ #include <boost/asio/steady_timer.hpp>
+ #include <boost/optional.hpp>

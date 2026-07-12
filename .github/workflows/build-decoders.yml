@@ -198,9 +198,125 @@ jobs:
           path: dist/dump1090-windows-amd64
           if-no-files-found: error
 
+  # Full ADS-B decoder for the 978 path (opt-in Enable978): readsb is a dump1090 superset
+  # that MERGES 978 UAT (pulled from dump978 via a uat_in connector) into its Beast stream,
+  # and also emits tar1090 JSON. Native Windows via a winsock port (the patch adds a wepoll
+  # epoll shim, winsock socket ops, and POSIX signal/priority/time shims).
+  readsb-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4   # for installer/patches/readsb-windows.patch
+
+      - name: Set up MSYS2 (mingw64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-rtl-sdr
+            mingw-w64-x86_64-libusb
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-zstd
+
+      - name: Build wiedehopf/readsb (winsock port)
+        run: |
+          set -euxo pipefail
+          PATCH="$(pwd)/installer/patches/readsb-windows.patch"
+          git clone --depth 1 https://github.com/wiedehopf/readsb /tmp/readsb
+          git -C /tmp/readsb apply --ignore-whitespace --verbose "$PATCH"
+          make -C /tmp/readsb RTLSDR=yes   # MINGW branch: DISABLE_INTERACTIVE, wepoll, -lws2_32
+          test -f /tmp/readsb/readsb.exe
+
+      - name: Bundle exe + runtime DLLs
+        run: |
+          set -euxo pipefail
+          mkdir -p dist/readsb-windows-amd64
+          cp /tmp/readsb/readsb.exe dist/readsb-windows-amd64/
+          ldd /tmp/readsb/readsb.exe \
+            | awk '/\/mingw64\/bin\// {print $3}' \
+            | while read -r dll; do cp -v "$dll" dist/readsb-windows-amd64/; done
+          cd dist/readsb-windows-amd64 && ./readsb.exe --version || true
+          cd - >/dev/null; ls -la dist/readsb-windows-amd64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: readsb-windows-amd64
+          path: dist/readsb-windows-amd64
+          if-no-files-found: error
+
+  # 978 MHz UAT demodulator (dump978-fa). Cross-platform (boost::asio + SoapySDR), so only
+  # a few _WIN32 guards are needed (the patch drops the POSIX stdin/stratux sources, swaps
+  # boost::regex->std::regex, and path.native()->.string()). SoapySDR loads its RTL-SDR
+  # plugin at runtime (dlopen), so we bundle that module too under soapymodules/.
+  dump978-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4   # for installer/patches/dump978-windows.patch
+
+      - name: Set up MSYS2 (mingw64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-boost
+            mingw-w64-x86_64-soapysdr
+            mingw-w64-x86_64-soapyrtlsdr
+            mingw-w64-x86_64-rtl-sdr
+            mingw-w64-x86_64-libusb
+
+      - name: Build flightaware/dump978 (boost + SoapySDR)
+        run: |
+          set -euxo pipefail
+          PATCH="$(pwd)/installer/patches/dump978-windows.patch"
+          git clone --depth 1 https://github.com/flightaware/dump978 /tmp/dump978
+          git -C /tmp/dump978 apply --ignore-whitespace --verbose "$PATCH"
+          make -C /tmp/dump978 dump978-fa \
+               CPPFLAGS=-D_USE_MATH_DEFINES \
+               LIBS='-lboost_program_options-mt -lboost_filesystem-mt -lpthread -lstdc++ -lm -lws2_32 -lmswsock'
+          test -f /tmp/dump978/dump978-fa.exe
+
+      - name: Bundle exe + DLLs + SoapyRTLSDR plugin
+        run: |
+          set -euxo pipefail
+          mkdir -p dist/dump978-windows-amd64/soapymodules
+          cp /tmp/dump978/dump978-fa.exe dist/dump978-windows-amd64/
+          ldd /tmp/dump978/dump978-fa.exe \
+            | awk '/\/mingw64\/bin\// {print $3}' \
+            | while read -r dll; do cp -v "$dll" dist/dump978-windows-amd64/; done
+          # the RTL-SDR SoapySDR module is dlopen'd at runtime (not in ldd) — bundle it +
+          # any of its own mingw DLLs. The agent sets SOAPY_SDR_PLUGIN_PATH to soapymodules/.
+          MOD="$(find /mingw64/lib/SoapySDR -iname '*rtlsdr*' | head -1)"
+          cp -v "$MOD" dist/dump978-windows-amd64/soapymodules/
+          ldd "$MOD" | awk '/\/mingw64\/bin\// {print $3}' \
+            | while read -r dll; do cp -vn "$dll" dist/dump978-windows-amd64/; done
+          ls -la dist/dump978-windows-amd64 dist/dump978-windows-amd64/soapymodules
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dump978-windows-amd64
+          path: dist/dump978-windows-amd64
+          if-no-files-found: error
+
   # Assemble everything + compile the one-click Flightpatch installer (unsigned).
   build-installer:
-    needs: [dumpvdl2-windows, wdi-simple-windows, dump1090-windows]
+    needs: [dumpvdl2-windows, wdi-simple-windows, dump1090-windows, readsb-windows, dump978-windows]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -223,6 +339,8 @@ jobs:
           set -euxo pipefail
           cp artifacts/dumpvdl2-windows-amd64/* installer/dist/decoders/
           cp artifacts/dump1090-windows-amd64/*  installer/dist/decoders/
+          cp    artifacts/readsb-windows-amd64/*  installer/dist/decoders/
+          cp -r artifacts/dump978-windows-amd64/* installer/dist/decoders/   # includes soapymodules/
           cp artifacts/wdi-simple-windows-amd64/* installer/dist/driver/
           # WinSW service host (stable v2, .NET Framework 4.x present on Win10/11)
           curl -fL -o installer/dist/service/WinSW.exe \

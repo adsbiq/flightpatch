@@ -23,8 +23,10 @@ type DeviceConfig struct {
 	// the matching decoder).
 	DecoderDir string       `json:"decoder_dir,omitempty"` // dir holding the decoder exes (default: <exe dir>)
 	VDL2Feed   string       `json:"vdl2_feed,omitempty"`   // feed.adsbiq.com:5552 (VDL2 UDP)
-	Gain       string       `json:"gain,omitempty"`        // rtl tuner gain (default "40")
+	Gain       string       `json:"gain,omitempty"`        // VDL2 rtl tuner gain (default "40")
+	AdsbGain   string       `json:"adsb_gain,omitempty"`   // 1090 gain; "-10" = auto-gain (adsb.im default), else fixed dB
 	VDL2Freqs  []string     `json:"vdl2_freqs,omitempty"`  // VDL2 channels in Hz
+	Enable978  bool         `json:"enable_978,omitempty"`  // opt-in 978 UAT: ADS-B role uses readsb (merges UAT from dump978); a "uat"-assigned dongle runs dump978-fa. Needs readsb.exe + dump978-fa.exe bundled.
 	Roles      []DongleRole `json:"roles,omitempty"`       // persisted per-serial role assignments
 
 	path string `json:"-"`
@@ -34,7 +36,7 @@ type DeviceConfig struct {
 // not have to re-probe on every start, and so the server can override a role.
 type DongleRole struct {
 	Serial string `json:"serial"`
-	Role   string `json:"role"` // "adsb" | "vdl2" | "off"
+	Role   string `json:"role"` // "adsb" | "vdl2" | "uat" | "off"
 }
 
 // defaultConfigPath is a per-OS location a service can write to.
@@ -83,6 +85,9 @@ func LoadConfig(path string) *DeviceConfig {
 	}
 	if c.Gain == "" {
 		c.Gain = "40"
+	}
+	if c.AdsbGain == "" {
+		c.AdsbGain = "-10" // dump1090 auto-gain (this fork: -10 == auto). adsb.im-style default.
 	}
 	if len(c.VDL2Freqs) == 0 {
 		// Common VDL2 channels (Hz), within one 2.1 Msps window.

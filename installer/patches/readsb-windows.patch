@@ -1,0 +1,4472 @@
+diff --git a/Makefile b/Makefile
+index 6d072e2..c836324 100644
+--- a/Makefile
++++ b/Makefile
+@@ -41,6 +41,13 @@ else ifeq ($(UNAME), Darwin)
+     LDFLAGS += -L/opt/homebrew/lib
+     LIBS = -pthread -lpthread -lm -lzstd
+     COMPAT += compat/apple/epoll_shim.o
++else ifneq (,$(findstring MINGW,$(UNAME)))
++    # Native Windows (MSYS2/mingw-w64) — no WSL. epoll via wepoll, eventfd skipped (NO_EVENT_FD).
++    CFLAGS += -D_WIN32_WINNT=0x0600 -D_USE_MATH_DEFINES -DDISABLE_INTERACTIVE -I./compat/windows
++    CFLAGS += -Wno-unused-parameter  # our compat shims intentionally ignore some POSIX args
++    CFLAGS += -Wno-error=return-type # winpthreads pthread_exit lacks the noreturn annotation
++    LIBS = -pthread -lpthread -lm -lzstd -lws2_32 -liphlpapi
++    COMPAT += compat/windows/epoll_shim.o compat/windows/wepoll.o compat/windows/net_init.o
+ else
+     LIBS = -pthread -lpthread -lm -lrt -lzstd
+ endif
+diff --git a/aircraft.c b/aircraft.c
+index 3a20ced..927b468 100644
+--- a/aircraft.c
++++ b/aircraft.c
+@@ -619,7 +619,7 @@ int dbUpdate(int64_t now) {
+         fprintf(stderr, "%s: dbUpdate: fstat failed, wat?!\n", filename);
+         goto DBU0;
+     }
+-    int64_t modTime = fileinfo.st_mtim.tv_sec;
++    int64_t modTime = fileinfo.st_mtime; // st_mtime (seconds) is portable; st_mtim is POSIX-only
+ 
+     if (Modes.dbModificationTime == modTime)
+         goto DBU0;
+diff --git a/anet.c b/anet.c
+index c566780..98957d7 100644
+--- a/anet.c
++++ b/anet.c
+@@ -52,22 +52,29 @@
+ // POSSIBILITY OF SUCH DAMAGE.
+ 
+ #include <sys/types.h>
+-#include <sys/socket.h>
+ #include <sys/stat.h>
+-#include <sys/un.h>
+-#include <netinet/in.h>
+-#include <netinet/tcp.h>
+-#include <arpa/inet.h>
+-#include <unistd.h>
+ #include <fcntl.h>
+ #include <string.h>
+-#include <netdb.h>
+ #include <errno.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/time.h>
++
++#if defined(_WIN32) || defined(__MINGW32__) || defined(__MINGW64__)
++#include "compat/windows/net_compat.h"
++#include "compat/windows/win_sockops.h"
+ #include <sys/resource.h>
++#else
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <arpa/inet.h>
++#include <unistd.h>
++#include <netdb.h>
++#include <sys/resource.h>
++#endif
+ 
+ #ifdef __APPLE__
+ #include "compat/apple/net_compat.h"
+diff --git a/anet.h b/anet.h
+index 129aa7c..e7b49b5 100644
+--- a/anet.h
++++ b/anet.h
+@@ -63,8 +63,12 @@
+ #endif
+ 
+ #include <sys/types.h>
++#if defined(_WIN32) || defined(__MINGW32__) || defined(__MINGW64__)
++#include "compat/windows/net_compat.h"
++#else
+ #include <sys/socket.h>
+ #include <netdb.h>
++#endif
+ 
+ int anetTcpConnect(char *err, char *addr, char *service, struct sockaddr_storage *ss);
+ int anetTcpNonBlockConnect(char *err, char *addr, char *service, struct sockaddr_storage *ss);
+diff --git a/compat/compat.h b/compat/compat.h
+index f505158..fa941c0 100644
+--- a/compat/compat.h
++++ b/compat/compat.h
+@@ -30,6 +30,38 @@
+ #include "apple/stat_compat.h"
+ #include "apple/thread_compat.h"
+ 
++#elif defined(_WIN32) || defined(__MINGW32__) || defined(__MINGW64__)
++
++// Native Windows (mingw-w64). Skip eventfd like Apple; epoll via wepoll; winsock glue.
++#define NO_EVENT_FD
++
++// Windows is little-endian
++# define bswap_16 __builtin_bswap16
++# define bswap_32 __builtin_bswap32
++# define bswap_64 __builtin_bswap64
++# define le16toh(x) (x)
++# define le32toh(x) (x)
++# define le64toh(x) (x)
++# define htole16(x) (x)
++# define htole32(x) (x)
++# define htole64(x) (x)
++
++#include "windows/net_compat.h"
++#include "windows/epoll_shim.h"
++#include "windows/mman_compat.h"
++#include "windows/sys_compat.h"
++
++// mingw's msvcrt CRT lacks C11 aligned_alloc. readsb frees these with free(), so a
++// free()-compatible allocator is required: plain malloc (16-byte aligned on Win x64).
++#include <stdlib.h>
++#define aligned_alloc(align, size) malloc(size)
++
++// -std=c11 on Windows doesn't expose M_PI (POSIX/GNU extension).
++#include <math.h>
++#ifndef M_PI
++#define M_PI 3.14159265358979323846
++#endif
++
+ #else // other platforms
+ 
+ # include <endian.h>
+diff --git a/compat/windows/arpa/inet.h b/compat/windows/arpa/inet.h
+new file mode 100644
+index 0000000..743de8d
+--- /dev/null
++++ b/compat/windows/arpa/inet.h
+@@ -0,0 +1,4 @@
++#ifndef WINSHIM_arpa_inet_h
++#define WINSHIM_arpa_inet_h
++#include "net_compat.h"
++#endif
+diff --git a/compat/windows/epoll_shim.c b/compat/windows/epoll_shim.c
+new file mode 100644
+index 0000000..4273e82
+--- /dev/null
++++ b/compat/windows/epoll_shim.c
+@@ -0,0 +1,46 @@
++/*
++ * compat/windows/epoll_shim.c — int<->HANDLE bridge over wepoll.
++ * Compiled as its own TU (does NOT include epoll_shim.h, so the epoll_* macros do not
++ * apply here) and calls wepoll's real HANDLE-based epoll_* functions.
++ */
++#include "wepoll.h"
++#include <stddef.h>
++
++/* readsb creates very few epoll instances (net_epfd + one per api thread). A tiny fixed
++ * table is plenty and avoids any allocation. Index == the int "fd" we hand back. */
++#define RSB_MAX_EPFD 32
++static HANDLE g_eptab[RSB_MAX_EPFD];
++static int    g_epcount = 0;
++
++static int alloc_slot(HANDLE h) {
++    if (!h) return -1;
++    if (g_epcount >= RSB_MAX_EPFD) return -1;
++    int fd = g_epcount++;
++    g_eptab[fd] = h;
++    return fd;
++}
++
++int rsb_epoll_create(int size) {
++    return alloc_slot(epoll_create(size));
++}
++
++int rsb_epoll_create1(int flags) {
++    return alloc_slot(epoll_create1(flags));
++}
++
++int rsb_epoll_ctl(int epfd, int op, int sockfd, struct epoll_event *ev) {
++    if (epfd < 0 || epfd >= g_epcount || !g_eptab[epfd]) return -1;
++    return epoll_ctl(g_eptab[epfd], op, (SOCKET) (uintptr_t) sockfd, ev);
++}
++
++int rsb_epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) {
++    if (epfd < 0 || epfd >= g_epcount || !g_eptab[epfd]) return -1;
++    return epoll_wait(g_eptab[epfd], events, maxevents, timeout);
++}
++
++int rsb_epoll_close(int epfd) {
++    if (epfd < 0 || epfd >= g_epcount || !g_eptab[epfd]) return -1;
++    int r = epoll_close(g_eptab[epfd]);
++    g_eptab[epfd] = NULL;
++    return r;
++}
+diff --git a/compat/windows/epoll_shim.h b/compat/windows/epoll_shim.h
+new file mode 100644
+index 0000000..fe10f13
+--- /dev/null
++++ b/compat/windows/epoll_shim.h
+@@ -0,0 +1,38 @@
++/*
++ * compat/windows/epoll_shim.h — native Windows (mingw-w64) epoll for readsb.
++ *
++ * readsb uses a POSIX int-based epoll API (int epfd, int socket fds). Windows has no
++ * epoll; we back it with wepoll (IOCP/AFD), whose epoll handle is a HANDLE and whose
++ * sockets are SOCKET. This header keeps readsb's int-based calls by routing them to
++ * small int wrappers (implemented in epoll_shim.c) that map int<->HANDLE via a table.
++ *
++ * struct epoll_event / epoll_data_t / EPOLL* constants come from wepoll.h.
++ */
++#ifndef WIN_EPOLL_SHIM_H
++#define WIN_EPOLL_SHIM_H
++
++#include "wepoll.h"   /* struct epoll_event, epoll_data_t, EPOLL* constants (HANDLE-based decls) */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* int-based wrappers readsb will actually call */
++int rsb_epoll_create(int size);
++int rsb_epoll_create1(int flags);
++int rsb_epoll_ctl(int epfd, int op, int sockfd, struct epoll_event *ev);
++int rsb_epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);
++int rsb_epoll_close(int epfd);   /* for the explicit close(net_epfd) site in net_io.c */
++
++#ifdef __cplusplus
++}
++#endif
++
++/* Route readsb's POSIX epoll names to our int wrappers. (Placed AFTER wepoll.h so its
++ * HANDLE-based declarations are parsed first; readsb call-sites get the macro form.) */
++#define epoll_create   rsb_epoll_create
++#define epoll_create1  rsb_epoll_create1
++#define epoll_ctl      rsb_epoll_ctl
++#define epoll_wait     rsb_epoll_wait
++
++#endif /* WIN_EPOLL_SHIM_H */
+diff --git a/compat/windows/epoll_shim.o b/compat/windows/epoll_shim.o
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f1838d7c4cc0b3a66bd30c6954753ae91d5eb79
+GIT binary patch
+literal 6745
+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
+QBHi#vx(MDC5f^v=0#1kSh5!Hn
+
+literal 0
+HcmV?d00001
+
+diff --git a/compat/windows/mman_compat.h b/compat/windows/mman_compat.h
+new file mode 100644
+index 0000000..4913b30
+--- /dev/null
++++ b/compat/windows/mman_compat.h
+@@ -0,0 +1,36 @@
++/*
++ * compat/windows/mman_compat.h — minimal mmap/munmap for native Windows (mingw).
++ * readsb only uses anonymous private mappings (MAP_ANONYMOUS|MAP_PRIVATE) as plain
++ * zeroed memory, so we back them with calloc/free. PROT_* are advisory here.
++ */
++#ifndef WIN_MMAN_COMPAT_H
++#define WIN_MMAN_COMPAT_H
++
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++
++#define PROT_NONE  0x0
++#define PROT_READ  0x1
++#define PROT_WRITE 0x2
++#define PROT_EXEC  0x4
++
++#define MAP_SHARED    0x01
++#define MAP_PRIVATE   0x02
++#define MAP_ANONYMOUS 0x20
++#define MAP_ANON      MAP_ANONYMOUS
++#define MAP_FAILED    ((void *) -1)
++
++static inline void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset) {
++	(void) addr; (void) prot; (void) flags; (void) fd; (void) offset;
++	void *p = calloc(1, length ? length : 1); // anonymous zeroed memory
++	return p ? p : MAP_FAILED;
++}
++
++static inline int munmap(void *addr, size_t length) {
++	(void) length;
++	free(addr);
++	return 0;
++}
++
++#endif /* WIN_MMAN_COMPAT_H */
+diff --git a/compat/windows/net_compat.h b/compat/windows/net_compat.h
+new file mode 100644
+index 0000000..d0bf405
+--- /dev/null
++++ b/compat/windows/net_compat.h
+@@ -0,0 +1,122 @@
++/*
++ * compat/windows/net_compat.h — global-safe winsock types/init/constants for readsb.
++ * Included everywhere (via compat/compat.h). Provides Windows socket headers, one-time
++ * WSAStartup, POSIX socket constants Windows lacks, an errno mapper, and inline socket
++ * op helpers. Does NOT redefine close/read/write (that is win_sockops.h, per-file only),
++ * so file I/O in non-network TUs is unaffected.
++ */
++#ifndef WIN_NET_COMPAT_H
++#define WIN_NET_COMPAT_H
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#if defined(__has_include)
++#  if __has_include(<afunix.h>)
++#    include <afunix.h>   /* AF_UNIX / sockaddr_un on Win10+ */
++#  endif
++#endif
++#include <windows.h>
++#include <errno.h>
++#include <stdint.h>
++#include <string.h>
++
++/* POSIX bits Windows names differently / lacks */
++#ifndef MSG_NOSIGNAL
++#define MSG_NOSIGNAL 0
++#endif
++#ifndef SHUT_RD
++#define SHUT_RD   SD_RECEIVE
++#define SHUT_WR   SD_SEND
++#define SHUT_RDWR SD_BOTH
++#endif
++#ifndef SOCK_NONBLOCK
++#define SOCK_NONBLOCK 0x4000   /* handled by our create helper, not passed to socket() */
++#endif
++#ifndef SOCK_CLOEXEC
++#define SOCK_CLOEXEC 0
++#endif
++#ifndef SOL_TCP
++#define SOL_TCP IPPROTO_TCP
++#endif
++/* Linux-only tuning knobs readsb may reference — no-op on Windows */
++#ifndef TCP_QUICKACK
++#define TCP_QUICKACK 12
++#endif
++#ifndef O_NONBLOCK
++#define O_NONBLOCK 0x800
++#endif
++
++/* winsock uses its own error codes; map the ones readsb tests against errno. */
++static inline int wsa_to_errno(int e) {
++    switch (e) {
++        case WSAEWOULDBLOCK: return EAGAIN;
++        case WSAEINPROGRESS: return EINPROGRESS;
++        case WSAEALREADY:    return EALREADY;
++        case WSAEINTR:       return EINTR;
++        case WSAECONNRESET:  return ECONNRESET;
++        case WSAECONNREFUSED:return ECONNREFUSED;
++        case WSAENOTCONN:    return ENOTCONN;
++        case WSAETIMEDOUT:   return ETIMEDOUT;
++        case WSAEADDRINUSE:  return EADDRINUSE;
++        default:             return e ? EIO : 0;
++    }
++}
++
++/* WSAStartup runs from compat/windows/net_init.c (a real linked TU with a constructor).
++ * A static-inline constructor in this header gets discarded, so winsock never inits and
++ * socket() fails with "creating socket: No error". */
++void win_net_init(void);
++
++/* socket() wrapper: (1) ensure WSAStartup; (2) STRIP the Linux-only SOCK_NONBLOCK/SOCK_CLOEXEC
++ * flags that readsb OR's into the type (Windows socket() rejects them as an invalid type — the
++ * real cause of "creating socket: No error"), applying non-blocking via ioctlsocket instead;
++ * (3) set errno on failure (winsock doesn't). */
++static inline int win_socket(int domain, int type, int protocol) {
++	win_net_init();
++	int want_nonblock = type & SOCK_NONBLOCK;
++	type &= ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
++	SOCKET s = socket(domain, type, protocol);
++	if (s == INVALID_SOCKET) { errno = wsa_to_errno(WSAGetLastError()); return -1; }
++	if (want_nonblock) { u_long m = 1; ioctlsocket(s, FIONBIO, &m); }
++	return (int) s;
++}
++#define socket(d, t, p) win_socket((d), (t), (p))
++
++/* socket op helpers used by win_sockops.h (errno-setting like POSIX) */
++static inline int win_closesocket(int fd) { int r = closesocket((SOCKET) (uintptr_t) fd); if (r) errno = wsa_to_errno(WSAGetLastError()); return r; }
++static inline long win_recv(int fd, void *buf, size_t n) { int r = recv((SOCKET) (uintptr_t) fd, (char *) buf, (int) n, 0); if (r < 0) errno = wsa_to_errno(WSAGetLastError()); return r; }
++static inline long win_send(int fd, const void *buf, size_t n) { int r = send((SOCKET) (uintptr_t) fd, (const char *) buf, (int) n, MSG_NOSIGNAL); if (r < 0) errno = wsa_to_errno(WSAGetLastError()); return r; }
++static inline int win_set_nonblock(int fd) { u_long m = 1; int r = ioctlsocket((SOCKET) (uintptr_t) fd, FIONBIO, &m); if (r) errno = wsa_to_errno(WSAGetLastError()); return r; }
++
++/* setsockopt/getsockopt take const char* on Windows (const void* on POSIX) → wrap. */
++static inline int win_setsockopt(int s, int lvl, int opt, const void *val, int len) {
++	int r = setsockopt((SOCKET) (uintptr_t) s, lvl, opt, (const char *) val, len);
++	if (r) errno = wsa_to_errno(WSAGetLastError());
++	return r;
++}
++static inline int win_getsockopt(int s, int lvl, int opt, void *val, int *len) {
++	int r = getsockopt((SOCKET) (uintptr_t) s, lvl, opt, (char *) val, len);
++	if (r) errno = wsa_to_errno(WSAGetLastError());
++	return r;
++}
++#define setsockopt(s, l, o, v, n) win_setsockopt((s), (l), (o), (v), (n))
++#define getsockopt(s, l, o, v, n) win_getsockopt((s), (l), (o), (v), (n))
++
++/* accept4 is a Linux extension: accept + optional SOCK_NONBLOCK. */
++static inline int win_accept4(int fd, struct sockaddr *a, socklen_t *l, int flags) {
++	SOCKET c = accept((SOCKET) (uintptr_t) fd, a, l);
++	if (c == INVALID_SOCKET) { errno = wsa_to_errno(WSAGetLastError()); return -1; }
++	if (flags & SOCK_NONBLOCK) { u_long m = 1; ioctlsocket(c, FIONBIO, &m); }
++	return (int) c;
++}
++#define accept4(fd, a, l, flags) win_accept4((fd), (a), (l), (flags))
++
++/* generic ioctl() stub — readsb only calls ioctl() for serial (sdr_beast.c), which is
++ * non-functional on Windows; socket ioctls go through ioctlsocket above. */
++static inline int win_ioctl(int fd, unsigned long req, ...) { (void) fd; (void) req; return 0; }
++#define ioctl win_ioctl
++
++#endif /* WIN_NET_COMPAT_H */
+diff --git a/compat/windows/net_init.c b/compat/windows/net_init.c
+new file mode 100644
+index 0000000..3eaee69
+--- /dev/null
++++ b/compat/windows/net_init.c
+@@ -0,0 +1,18 @@
++/*
++ * compat/windows/net_init.c — one real, linked TU so the WSAStartup constructor actually
++ * fires at process start (a static-inline constructor in net_compat.h is discarded).
++ */
++#include "net_compat.h"
++
++static int win_wsa_started = 0;
++
++void win_net_init(void) {
++	if (!win_wsa_started) {
++		WSADATA w;
++		WSAStartup(MAKEWORD(2, 2), &w);
++		win_wsa_started = 1;
++	}
++}
++
++__attribute__((constructor))
++static void win_net_ctor(void) { win_net_init(); }
+diff --git a/compat/windows/net_init.o b/compat/windows/net_init.o
+new file mode 100644
+index 0000000000000000000000000000000000000000..0aa1e38cadd894ffda0e87cad0b0f9a1e8295dd4
+GIT binary patch
+literal 5502
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/compat/windows/netdb.h b/compat/windows/netdb.h
+new file mode 100644
+index 0000000..f17fa2f
+--- /dev/null
++++ b/compat/windows/netdb.h
+@@ -0,0 +1,4 @@
++#ifndef WINSHIM_netdb_h
++#define WINSHIM_netdb_h
++#include "net_compat.h"
++#endif
+diff --git a/compat/windows/netinet/in.h b/compat/windows/netinet/in.h
+new file mode 100644
+index 0000000..f7e47e5
+--- /dev/null
++++ b/compat/windows/netinet/in.h
+@@ -0,0 +1,4 @@
++#ifndef WINSHIM_netinet_in_h
++#define WINSHIM_netinet_in_h
++#include "net_compat.h"
++#endif
+diff --git a/compat/windows/netinet/tcp.h b/compat/windows/netinet/tcp.h
+new file mode 100644
+index 0000000..be18ea1
+--- /dev/null
++++ b/compat/windows/netinet/tcp.h
+@@ -0,0 +1,4 @@
++#ifndef WINSHIM_netinet_tcp_h
++#define WINSHIM_netinet_tcp_h
++#include "net_compat.h"
++#endif
+diff --git a/compat/windows/poll.h b/compat/windows/poll.h
+new file mode 100644
+index 0000000..1594773
+--- /dev/null
++++ b/compat/windows/poll.h
+@@ -0,0 +1,7 @@
++#ifndef WINSHIM_POLL_H
++#define WINSHIM_POLL_H
++#include "net_compat.h"
++#ifndef poll
++#define poll(fds,nfds,timeout) WSAPoll((fds),(nfds),(timeout))
++#endif
++#endif
+diff --git a/compat/windows/sys/epoll.h b/compat/windows/sys/epoll.h
+new file mode 100644
+index 0000000..7929c93
+--- /dev/null
++++ b/compat/windows/sys/epoll.h
+@@ -0,0 +1 @@
++#include "epoll_shim.h"
+diff --git a/compat/windows/sys/eventfd.h b/compat/windows/sys/eventfd.h
+new file mode 100644
+index 0000000..ed9fbb7
+--- /dev/null
++++ b/compat/windows/sys/eventfd.h
+@@ -0,0 +1 @@
++/* eventfd skipped on Windows (NO_EVENT_FD) */
+diff --git a/compat/windows/sys/ioctl.h b/compat/windows/sys/ioctl.h
+new file mode 100644
+index 0000000..d904454
+--- /dev/null
++++ b/compat/windows/sys/ioctl.h
+@@ -0,0 +1,5 @@
++/* Windows: socket ioctls via ioctlsocket; generic ioctl() stub both live in net_compat.h */
++#ifndef WINSHIM_SYS_IOCTL_H
++#define WINSHIM_SYS_IOCTL_H
++#include "net_compat.h"
++#endif
+diff --git a/compat/windows/sys/mman.h b/compat/windows/sys/mman.h
+new file mode 100644
+index 0000000..04b8564
+--- /dev/null
++++ b/compat/windows/sys/mman.h
+@@ -0,0 +1 @@
++#include "mman_compat.h"
+diff --git a/compat/windows/sys/resource.h b/compat/windows/sys/resource.h
+new file mode 100644
+index 0000000..4a0f2ae
+--- /dev/null
++++ b/compat/windows/sys/resource.h
+@@ -0,0 +1,10 @@
++#ifndef WINSHIM_RESOURCE_H
++#define WINSHIM_RESOURCE_H
++#include <stdint.h>
++typedef uint64_t rlim_t;
++struct rlimit { rlim_t rlim_cur; rlim_t rlim_max; };
++#define RLIMIT_NOFILE 7
++#define RLIM_INFINITY (~(rlim_t)0)
++static inline int getrlimit(int r, struct rlimit *l){ (void)r; if(l){ l->rlim_cur=8192; l->rlim_max=8192; } return 0; }
++static inline int setrlimit(int r, const struct rlimit *l){ (void)r; (void)l; return 0; }
++#endif
+diff --git a/compat/windows/sys/socket.h b/compat/windows/sys/socket.h
+new file mode 100644
+index 0000000..fa1b439
+--- /dev/null
++++ b/compat/windows/sys/socket.h
+@@ -0,0 +1,4 @@
++#ifndef WINSHIM_sys_socket_h
++#define WINSHIM_sys_socket_h
++#include "net_compat.h"
++#endif
+diff --git a/compat/windows/sys/un.h b/compat/windows/sys/un.h
+new file mode 100644
+index 0000000..6c7f83f
+--- /dev/null
++++ b/compat/windows/sys/un.h
+@@ -0,0 +1,4 @@
++#ifndef WINSHIM_sys_un_h
++#define WINSHIM_sys_un_h
++#include "net_compat.h"
++#endif
+diff --git a/compat/windows/sys_compat.h b/compat/windows/sys_compat.h
+new file mode 100644
+index 0000000..e866414
+--- /dev/null
++++ b/compat/windows/sys_compat.h
+@@ -0,0 +1,186 @@
++/*
++ * compat/windows/sys_compat.h — POSIX signals / priority / CPU-affinity / *_r time
++ * shims for native Windows (mingw). readsb's startup code (readsb.c) uses these Linux
++ * facilities; Windows lacks most, so we map or stub them. (Same idea as the apple compat.)
++ */
++#ifndef WIN_SYS_COMPAT_H
++#define WIN_SYS_COMPAT_H
++
++#include <signal.h>
++#include <time.h>
++#include <stddef.h>
++#include <windows.h>
++
++/* ---- POSIX signals Windows lacks (define as harmless numbers) ---- */
++#ifndef SIGHUP
++#define SIGHUP 1
++#endif
++#ifndef SIGQUIT
++#define SIGQUIT 3
++#endif
++#ifndef SIGKILL
++#define SIGKILL 9
++#endif
++#ifndef SIGUSR1
++#define SIGUSR1 10
++#endif
++#ifndef SIGUSR2
++#define SIGUSR2 12
++#endif
++#ifndef SIGPIPE
++#define SIGPIPE 13
++#endif
++#ifndef SIGCHLD
++#define SIGCHLD 17
++#endif
++#ifndef SIGSTOP
++#define SIGSTOP 19
++#endif
++#ifndef SIGCONT
++#define SIGCONT 18
++#endif
++
++/* ---- sigaction → route to signal() for the handlers Windows actually supports ---- */
++#ifndef WIN_HAVE_SIGSET_T
++typedef int win_sigset_t;
++#define sigset_t win_sigset_t
++#endif
++struct sigaction {
++	void (*sa_handler)(int);
++	sigset_t sa_mask;
++	int sa_flags;
++};
++static inline int sigemptyset(sigset_t *s) { if (s) *s = 0; return 0; }
++static inline int sigfillset(sigset_t *s) { if (s) *s = ~0; return 0; }
++static inline int sigaddset(sigset_t *s, int n) { (void) n; if (s) *s |= 1; return 0; }
++static inline int win_sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
++	(void) old;
++	if (act && act->sa_handler && (sig == SIGINT || sig == SIGTERM || sig == SIGABRT))
++		signal(sig, act->sa_handler);
++	return 0;
++}
++#define sigaction(s, a, o) win_sigaction((s), (a), (o))
++
++/* ---- priority (nice): no-op; real Idle-priority is set via SetPriorityClass elsewhere ---- */
++#ifndef PRIO_PROCESS
++#define PRIO_PROCESS 0
++#endif
++static inline int getpriority(int which, int who) { (void) which; (void) who; return 0; }
++static inline int setpriority(int which, int who, int prio) { (void) which; (void) who; (void) prio; return 0; }
++
++/* ---- CPU affinity → report core count, ignore pinning ---- */
++typedef struct { int unused; } cpu_set_t;
++#ifndef CPU_SETSIZE
++#define CPU_SETSIZE 1024
++#endif
++static inline int win_ncpu(void) { SYSTEM_INFO si; GetSystemInfo(&si); return (int) si.dwNumberOfProcessors; }
++#define CPU_COUNT(set)      win_ncpu()
++#define CPU_ZERO(set)       ((void) 0)
++#define CPU_SET(cpu, set)   ((void) 0)
++#define CPU_CLR(cpu, set)   ((void) 0)
++#define CPU_ISSET(cpu, set) 1
++static inline int sched_getaffinity(int pid, size_t sz, cpu_set_t *set) { (void) pid; (void) sz; (void) set; return 0; }
++static inline int sched_setaffinity(int pid, size_t sz, const cpu_set_t *set) { (void) pid; (void) sz; (void) set; return 0; }
++
++/* ---- *_r time functions via Windows *_s ---- */
++#ifndef gmtime_r
++static inline struct tm *gmtime_r(const time_t *t, struct tm *out) { return gmtime_s(out, t) == 0 ? out : NULL; }
++#endif
++#ifndef localtime_r
++static inline struct tm *localtime_r(const time_t *t, struct tm *out) { return localtime_s(out, t) == 0 ? out : NULL; }
++#endif
++
++/* msvcrt strftime is C89-only (no %T/%F). Translate them, then call the real strftime.
++ * Defined before the macro, so this body binds the real strftime (no recursion). */
++static inline size_t win_strftime(char *s, size_t max, const char *fmt, const struct tm *tm) {
++	char f2[256];
++	size_t j = 0;
++	for (size_t i = 0; fmt[i] && j < sizeof(f2) - 12; i++) {
++		if (fmt[i] == '%' && fmt[i + 1] == 'T') { memcpy(f2 + j, "%H:%M:%S", 8); j += 8; i++; }
++		else if (fmt[i] == '%' && fmt[i + 1] == 'F') { memcpy(f2 + j, "%Y-%m-%d", 8); j += 8; i++; }
++		else f2[j++] = fmt[i];
++	}
++	f2[j] = 0;
++	return strftime(s, max, f2, tm);
++}
++#define strftime(s, max, fmt, tm) win_strftime((s), (max), (fmt), (tm))
++
++/* ---- BSD/GNU libc bits Windows lacks ---- */
++#include <direct.h>
++#include <string.h>
++#include <stdlib.h>
++
++#ifndef srandom
++#define srandom srand
++#endif
++#ifndef random
++#define random rand
++#endif
++
++/* POSIX mkdir(path, mode) → Windows _mkdir(path) (drops the mode) */
++#define mkdir(path, mode) _mkdir(path)
++
++static inline char *strcasestr(const char *hay, const char *needle) {
++	size_t nl = strlen(needle);
++	if (!nl) return (char *) hay;
++	for (; *hay; hay++)
++		if (_strnicmp(hay, needle, nl) == 0) return (char *) hay;
++	return NULL;
++}
++/* symlink/readlink: Windows symlinks need privilege; readsb uses them only for the
++ * tar1090 history dir layout (non-critical for feeding) → stub. */
++static inline int symlink(const char *target, const char *linkpath) { (void) target; (void) linkpath; return 0; }
++static inline int readlink(const char *path, char *buf, size_t len) { (void) path; (void) buf; (void) len; return -1; }
++
++static inline char *strsignal(int s) { (void) s; return (char *) "signal"; }
++static inline int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
++	(void) how; (void) set; (void) old; return 0;
++}
++
++/* timegm → Windows CRT UTC mktime */
++#ifndef timegm
++#define timegm _mkgmtime
++#endif
++
++/* (pthread_tryjoin_np not needed on Windows: threadSignalJoin uses the blocking-join path.) */
++
++/* strsep (BSD) */
++static inline char *strsep(char **stringp, const char *delim) {
++	char *start = *stringp, *p;
++	if (!start) return NULL;
++	p = start + strcspn(start, delim);
++	if (*p) { *p = '\0'; *stringp = p + 1; } else { *stringp = NULL; }
++	return start;
++}
++
++/* Minimal strptime — enough for readsb's SBS timestamp "%Y/%m/%d %H:%M:%S". */
++static inline char *strptime(const char *s, const char *fmt, struct tm *tm) {
++	while (*fmt) {
++		if (*fmt == '%') {
++			fmt++;
++			int val = 0, n = 0;
++			while (*s >= '0' && *s <= '9') { val = val * 10 + (*s++ - '0'); n++; }
++			if (*fmt != 'y' && n == 0) return NULL;
++			switch (*fmt) {
++			case 'Y': tm->tm_year = val - 1900; break;
++			case 'y': tm->tm_year = val < 69 ? val + 100 : val; break;
++			case 'm': tm->tm_mon = val - 1; break;
++			case 'd': tm->tm_mday = val; break;
++			case 'H': tm->tm_hour = val; break;
++			case 'M': tm->tm_min = val; break;
++			case 'S': tm->tm_sec = val; break;
++			default: return NULL; /* unsupported specifier */
++			}
++			fmt++;
++		} else if (*fmt == ' ') {
++			while (*s == ' ' || *s == '\t') s++;
++			fmt++;
++		} else {
++			if (*s != *fmt) return NULL;
++			s++; fmt++;
++		}
++	}
++	return (char *) s;
++}
++
++#endif /* WIN_SYS_COMPAT_H */
+diff --git a/compat/windows/termios.h b/compat/windows/termios.h
+new file mode 100644
+index 0000000..9382c36
+--- /dev/null
++++ b/compat/windows/termios.h
+@@ -0,0 +1,122 @@
++/*
++ * compat/windows/termios.h — stub so sdr_beast.c (hardware Beast-over-SERIAL receiver)
++ * compiles on native Windows. Serial config is a no-op here; RTL-SDR is the supported
++ * input on Windows. (A real Win32-COM implementation could replace these later.)
++ */
++#ifndef WIN_TERMIOS_H
++#define WIN_TERMIOS_H
++
++#include "net_compat.h"   /* for the generic ioctl() stub used by sdr_beast.c */
++
++/* macOS-only serial-speed ioctl referenced by sdr_beast.c (never reached on Windows) */
++#ifndef IOSSIOSPEED
++#define IOSSIOSPEED 0x80045402UL
++#endif
++
++typedef unsigned int tcflag_t;
++typedef unsigned char cc_t;
++typedef unsigned int speed_t;
++
++#define NCCS 32
++struct termios {
++	tcflag_t c_iflag, c_oflag, c_cflag, c_lflag;
++	cc_t c_cc[NCCS];
++	speed_t c_ispeed, c_ospeed;
++};
++
++/* control-char indices */
++#define VMIN  6
++#define VTIME 5
++
++/* tcsetattr actions / tcflush queues */
++#define TCSANOW   0
++#define TCSADRAIN 1
++#define TCSAFLUSH 2
++#define TCIFLUSH  0
++#define TCOFLUSH  1
++#define TCIOFLUSH 2
++
++/* c_cflag / c_iflag / c_oflag / c_lflag bits (advisory; stub ignores them) */
++#define CSIZE   0x0000
++#define CS8     0x0000
++#define CSTOPB  0x0000
++#define CREAD   0x0000
++#define PARENB  0x0000
++#define PARODD  0x0000
++#define HUPCL   0x0000
++#define CLOCAL  0x0000
++#define CRTSCTS 0x0000
++#define IGNBRK  0x0000
++#define BRKINT  0x0000
++#define IGNPAR  0x0000
++#define PARMRK  0x0000
++#define INPCK   0x0000
++#define ISTRIP  0x0000
++#define INLCR   0x0000
++#define IGNCR   0x0000
++#define ICRNL   0x0000
++#define IXON    0x0000
++#define IXOFF   0x0000
++#define IXANY   0x0000
++#define OPOST   0x0000
++#define ONLCR   0x0000
++#define ECHO    0x0000
++#define ECHOE   0x0000
++#define ECHONL  0x0000
++#define ICANON  0x0000
++#define ISIG    0x0000
++#define IEXTEN  0x0000
++
++/* baud constants → their numeric values (unused by the stub) */
++#define B0        0
++#define B50       50
++#define B75       75
++#define B110      110
++#define B134      134
++#define B150      150
++#define B200      200
++#define B300      300
++#define B600      600
++#define B1200     1200
++#define B1800     1800
++#define B2400     2400
++#define B4800     4800
++#define B9600     9600
++#define B19200    19200
++#define B38400    38400
++#define B57600    57600
++#define B115200   115200
++#define B230400   230400
++#define B460800   460800
++#define B500000   500000
++#define B576000   576000
++#define B921600   921600
++#define B1000000  1000000
++#define B1152000  1152000
++#define B1500000  1500000
++#define B2000000  2000000
++#define B2500000  2500000
++#define B3000000  3000000
++#define B3500000  3500000
++#define B4000000  4000000
++
++/* open() flag + serial modem-control ioctls Windows lacks (stub) */
++#ifndef O_NOCTTY
++#define O_NOCTTY 0
++#endif
++#define TIOCMGET  0x5415
++#define TIOCMSET  0x5418
++#define TIOCMBIS  0x5416
++#define TIOCMBIC  0x5417
++#define TIOCM_DTR 0x002
++#define TIOCM_RTS 0x004
++
++static inline int tcgetattr(int fd, struct termios *t) { (void) fd; (void) t; return 0; }
++static inline int tcsetattr(int fd, int act, const struct termios *t) { (void) fd; (void) act; (void) t; return 0; }
++static inline int tcflush(int fd, int queue) { (void) fd; (void) queue; return 0; }
++static inline int cfsetispeed(struct termios *t, speed_t s) { if (t) t->c_ispeed = s; return 0; }
++static inline int cfsetospeed(struct termios *t, speed_t s) { if (t) t->c_ospeed = s; return 0; }
++static inline speed_t cfgetispeed(const struct termios *t) { return t ? t->c_ispeed : 0; }
++static inline speed_t cfgetospeed(const struct termios *t) { return t ? t->c_ospeed : 0; }
++
++#endif /* WIN_TERMIOS_H */
+diff --git a/compat/windows/wepoll.c b/compat/windows/wepoll.c
+new file mode 100644
+index 0000000..186d3f2
+--- /dev/null
++++ b/compat/windows/wepoll.c
+@@ -0,0 +1,2253 @@
++/*
++ * wepoll - epoll for Windows
++ * https://github.com/piscisaureus/wepoll
++ *
++ * Copyright 2012-2020, Bert Belder <bertbelder@gmail.com>
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met:
++ *
++ *   * Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *
++ *   * Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in the
++ *     documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef WEPOLL_EXPORT
++#define WEPOLL_EXPORT
++#endif
++
++#include <stdint.h>
++
++enum EPOLL_EVENTS {
++  EPOLLIN      = (int) (1U <<  0),
++  EPOLLPRI     = (int) (1U <<  1),
++  EPOLLOUT     = (int) (1U <<  2),
++  EPOLLERR     = (int) (1U <<  3),
++  EPOLLHUP     = (int) (1U <<  4),
++  EPOLLRDNORM  = (int) (1U <<  6),
++  EPOLLRDBAND  = (int) (1U <<  7),
++  EPOLLWRNORM  = (int) (1U <<  8),
++  EPOLLWRBAND  = (int) (1U <<  9),
++  EPOLLMSG     = (int) (1U << 10), /* Never reported. */
++  EPOLLRDHUP   = (int) (1U << 13),
++  EPOLLONESHOT = (int) (1U << 31)
++};
++
++#define EPOLLIN      (1U <<  0)
++#define EPOLLPRI     (1U <<  1)
++#define EPOLLOUT     (1U <<  2)
++#define EPOLLERR     (1U <<  3)
++#define EPOLLHUP     (1U <<  4)
++#define EPOLLRDNORM  (1U <<  6)
++#define EPOLLRDBAND  (1U <<  7)
++#define EPOLLWRNORM  (1U <<  8)
++#define EPOLLWRBAND  (1U <<  9)
++#define EPOLLMSG     (1U << 10)
++#define EPOLLRDHUP   (1U << 13)
++#define EPOLLONESHOT (1U << 31)
++
++#define EPOLL_CTL_ADD 1
++#define EPOLL_CTL_MOD 2
++#define EPOLL_CTL_DEL 3
++
++typedef void* HANDLE;
++typedef uintptr_t SOCKET;
++
++typedef union epoll_data {
++  void* ptr;
++  int fd;
++  uint32_t u32;
++  uint64_t u64;
++  SOCKET sock; /* Windows specific */
++  HANDLE hnd;  /* Windows specific */
++} epoll_data_t;
++
++struct epoll_event {
++  uint32_t events;   /* Epoll events and flags */
++  epoll_data_t data; /* User data variable */
++};
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++WEPOLL_EXPORT HANDLE epoll_create(int size);
++WEPOLL_EXPORT HANDLE epoll_create1(int flags);
++
++WEPOLL_EXPORT int epoll_close(HANDLE ephnd);
++
++WEPOLL_EXPORT int epoll_ctl(HANDLE ephnd,
++                            int op,
++                            SOCKET sock,
++                            struct epoll_event* event);
++
++WEPOLL_EXPORT int epoll_wait(HANDLE ephnd,
++                             struct epoll_event* events,
++                             int maxevents,
++                             int timeout);
++
++#ifdef __cplusplus
++} /* extern "C" */
++#endif
++
++#include <assert.h>
++
++#include <stdlib.h>
++
++#define WEPOLL_INTERNAL static
++#define WEPOLL_INTERNAL_EXTERN static
++
++#if defined(__clang__)
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wnonportable-system-include-path"
++#pragma clang diagnostic ignored "-Wreserved-id-macro"
++#elif defined(_MSC_VER)
++#pragma warning(push, 1)
++#endif
++
++#undef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++
++#undef _WIN32_WINNT
++#define _WIN32_WINNT 0x0600
++
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#include <windows.h>
++
++#if defined(__clang__)
++#pragma clang diagnostic pop
++#elif defined(_MSC_VER)
++#pragma warning(pop)
++#endif
++
++WEPOLL_INTERNAL int nt_global_init(void);
++
++typedef LONG NTSTATUS;
++typedef NTSTATUS* PNTSTATUS;
++
++#ifndef NT_SUCCESS
++#define NT_SUCCESS(status) (((NTSTATUS)(status)) >= 0)
++#endif
++
++#ifndef STATUS_SUCCESS
++#define STATUS_SUCCESS ((NTSTATUS) 0x00000000L)
++#endif
++
++#ifndef STATUS_PENDING
++#define STATUS_PENDING ((NTSTATUS) 0x00000103L)
++#endif
++
++#ifndef STATUS_CANCELLED
++#define STATUS_CANCELLED ((NTSTATUS) 0xC0000120L)
++#endif
++
++#ifndef STATUS_NOT_FOUND
++#define STATUS_NOT_FOUND ((NTSTATUS) 0xC0000225L)
++#endif
++
++typedef struct _IO_STATUS_BLOCK {
++  NTSTATUS Status;
++  ULONG_PTR Information;
++} IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
++
++typedef VOID(NTAPI* PIO_APC_ROUTINE)(PVOID ApcContext,
++                                     PIO_STATUS_BLOCK IoStatusBlock,
++                                     ULONG Reserved);
++
++typedef struct _UNICODE_STRING {
++  USHORT Length;
++  USHORT MaximumLength;
++  PWSTR Buffer;
++} UNICODE_STRING, *PUNICODE_STRING;
++
++#define RTL_CONSTANT_STRING(s) \
++  { sizeof(s) - sizeof((s)[0]), sizeof(s), s }
++
++typedef struct _OBJECT_ATTRIBUTES {
++  ULONG Length;
++  HANDLE RootDirectory;
++  PUNICODE_STRING ObjectName;
++  ULONG Attributes;
++  PVOID SecurityDescriptor;
++  PVOID SecurityQualityOfService;
++} OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
++
++#define RTL_CONSTANT_OBJECT_ATTRIBUTES(ObjectName, Attributes) \
++  { sizeof(OBJECT_ATTRIBUTES), NULL, ObjectName, Attributes, NULL, NULL }
++
++#ifndef FILE_OPEN
++#define FILE_OPEN 0x00000001UL
++#endif
++
++#define KEYEDEVENT_WAIT 0x00000001UL
++#define KEYEDEVENT_WAKE 0x00000002UL
++#define KEYEDEVENT_ALL_ACCESS \
++  (STANDARD_RIGHTS_REQUIRED | KEYEDEVENT_WAIT | KEYEDEVENT_WAKE)
++
++#define NT_NTDLL_IMPORT_LIST(X)           \
++  X(NTSTATUS,                             \
++    NTAPI,                                \
++    NtCancelIoFileEx,                     \
++    (HANDLE FileHandle,                   \
++     PIO_STATUS_BLOCK IoRequestToCancel,  \
++     PIO_STATUS_BLOCK IoStatusBlock))     \
++                                          \
++  X(NTSTATUS,                             \
++    NTAPI,                                \
++    NtCreateFile,                         \
++    (PHANDLE FileHandle,                  \
++     ACCESS_MASK DesiredAccess,           \
++     POBJECT_ATTRIBUTES ObjectAttributes, \
++     PIO_STATUS_BLOCK IoStatusBlock,      \
++     PLARGE_INTEGER AllocationSize,       \
++     ULONG FileAttributes,                \
++     ULONG ShareAccess,                   \
++     ULONG CreateDisposition,             \
++     ULONG CreateOptions,                 \
++     PVOID EaBuffer,                      \
++     ULONG EaLength))                     \
++                                          \
++  X(NTSTATUS,                             \
++    NTAPI,                                \
++    NtCreateKeyedEvent,                   \
++    (PHANDLE KeyedEventHandle,            \
++     ACCESS_MASK DesiredAccess,           \
++     POBJECT_ATTRIBUTES ObjectAttributes, \
++     ULONG Flags))                        \
++                                          \
++  X(NTSTATUS,                             \
++    NTAPI,                                \
++    NtDeviceIoControlFile,                \
++    (HANDLE FileHandle,                   \
++     HANDLE Event,                        \
++     PIO_APC_ROUTINE ApcRoutine,          \
++     PVOID ApcContext,                    \
++     PIO_STATUS_BLOCK IoStatusBlock,      \
++     ULONG IoControlCode,                 \
++     PVOID InputBuffer,                   \
++     ULONG InputBufferLength,             \
++     PVOID OutputBuffer,                  \
++     ULONG OutputBufferLength))           \
++                                          \
++  X(NTSTATUS,                             \
++    NTAPI,                                \
++    NtReleaseKeyedEvent,                  \
++    (HANDLE KeyedEventHandle,             \
++     PVOID KeyValue,                      \
++     BOOLEAN Alertable,                   \
++     PLARGE_INTEGER Timeout))             \
++                                          \
++  X(NTSTATUS,                             \
++    NTAPI,                                \
++    NtWaitForKeyedEvent,                  \
++    (HANDLE KeyedEventHandle,             \
++     PVOID KeyValue,                      \
++     BOOLEAN Alertable,                   \
++     PLARGE_INTEGER Timeout))             \
++                                          \
++  X(ULONG, WINAPI, RtlNtStatusToDosError, (NTSTATUS Status))
++
++#define X(return_type, attributes, name, parameters) \
++  WEPOLL_INTERNAL_EXTERN return_type(attributes* name) parameters;
++NT_NTDLL_IMPORT_LIST(X)
++#undef X
++
++#define AFD_POLL_RECEIVE           0x0001
++#define AFD_POLL_RECEIVE_EXPEDITED 0x0002
++#define AFD_POLL_SEND              0x0004
++#define AFD_POLL_DISCONNECT        0x0008
++#define AFD_POLL_ABORT             0x0010
++#define AFD_POLL_LOCAL_CLOSE       0x0020
++#define AFD_POLL_ACCEPT            0x0080
++#define AFD_POLL_CONNECT_FAIL      0x0100
++
++typedef struct _AFD_POLL_HANDLE_INFO {
++  HANDLE Handle;
++  ULONG Events;
++  NTSTATUS Status;
++} AFD_POLL_HANDLE_INFO, *PAFD_POLL_HANDLE_INFO;
++
++typedef struct _AFD_POLL_INFO {
++  LARGE_INTEGER Timeout;
++  ULONG NumberOfHandles;
++  ULONG Exclusive;
++  AFD_POLL_HANDLE_INFO Handles[1];
++} AFD_POLL_INFO, *PAFD_POLL_INFO;
++
++WEPOLL_INTERNAL int afd_create_device_handle(HANDLE iocp_handle,
++                                             HANDLE* afd_device_handle_out);
++
++WEPOLL_INTERNAL int afd_poll(HANDLE afd_device_handle,
++                             AFD_POLL_INFO* poll_info,
++                             IO_STATUS_BLOCK* io_status_block);
++WEPOLL_INTERNAL int afd_cancel_poll(HANDLE afd_device_handle,
++                                    IO_STATUS_BLOCK* io_status_block);
++
++#define return_map_error(value) \
++  do {                          \
++    err_map_win_error();        \
++    return (value);             \
++  } while (0)
++
++#define return_set_error(value, error) \
++  do {                                 \
++    err_set_win_error(error);          \
++    return (value);                    \
++  } while (0)
++
++WEPOLL_INTERNAL void err_map_win_error(void);
++WEPOLL_INTERNAL void err_set_win_error(DWORD error);
++WEPOLL_INTERNAL int err_check_handle(HANDLE handle);
++
++#define IOCTL_AFD_POLL 0x00012024
++
++static UNICODE_STRING afd__device_name =
++    RTL_CONSTANT_STRING(L"\\Device\\Afd\\Wepoll");
++
++static OBJECT_ATTRIBUTES afd__device_attributes =
++    RTL_CONSTANT_OBJECT_ATTRIBUTES(&afd__device_name, 0);
++
++int afd_create_device_handle(HANDLE iocp_handle,
++                             HANDLE* afd_device_handle_out) {
++  HANDLE afd_device_handle;
++  IO_STATUS_BLOCK iosb;
++  NTSTATUS status;
++
++  /* By opening \Device\Afd without specifying any extended attributes, we'll
++   * get a handle that lets us talk to the AFD driver, but that doesn't have an
++   * associated endpoint (so it's not a socket). */
++  status = NtCreateFile(&afd_device_handle,
++                        SYNCHRONIZE,
++                        &afd__device_attributes,
++                        &iosb,
++                        NULL,
++                        0,
++                        FILE_SHARE_READ | FILE_SHARE_WRITE,
++                        FILE_OPEN,
++                        0,
++                        NULL,
++                        0);
++  if (status != STATUS_SUCCESS)
++    return_set_error(-1, RtlNtStatusToDosError(status));
++
++  if (CreateIoCompletionPort(afd_device_handle, iocp_handle, 0, 0) == NULL)
++    goto error;
++
++  if (!SetFileCompletionNotificationModes(afd_device_handle,
++                                          FILE_SKIP_SET_EVENT_ON_HANDLE))
++    goto error;
++
++  *afd_device_handle_out = afd_device_handle;
++  return 0;
++
++error:
++  CloseHandle(afd_device_handle);
++  return_map_error(-1);
++}
++
++int afd_poll(HANDLE afd_device_handle,
++             AFD_POLL_INFO* poll_info,
++             IO_STATUS_BLOCK* io_status_block) {
++  NTSTATUS status;
++
++  /* Blocking operation is not supported. */
++  assert(io_status_block != NULL);
++
++  io_status_block->Status = STATUS_PENDING;
++  status = NtDeviceIoControlFile(afd_device_handle,
++                                 NULL,
++                                 NULL,
++                                 io_status_block,
++                                 io_status_block,
++                                 IOCTL_AFD_POLL,
++                                 poll_info,
++                                 sizeof *poll_info,
++                                 poll_info,
++                                 sizeof *poll_info);
++
++  if (status == STATUS_SUCCESS)
++    return 0;
++  else if (status == STATUS_PENDING)
++    return_set_error(-1, ERROR_IO_PENDING);
++  else
++    return_set_error(-1, RtlNtStatusToDosError(status));
++}
++
++int afd_cancel_poll(HANDLE afd_device_handle,
++                    IO_STATUS_BLOCK* io_status_block) {
++  NTSTATUS cancel_status;
++  IO_STATUS_BLOCK cancel_iosb;
++
++  /* If the poll operation has already completed or has been cancelled earlier,
++   * there's nothing left for us to do. */
++  if (io_status_block->Status != STATUS_PENDING)
++    return 0;
++
++  cancel_status =
++      NtCancelIoFileEx(afd_device_handle, io_status_block, &cancel_iosb);
++
++  /* NtCancelIoFileEx() may return STATUS_NOT_FOUND if the operation completed
++   * just before calling NtCancelIoFileEx(). This is not an error. */
++  if (cancel_status == STATUS_SUCCESS || cancel_status == STATUS_NOT_FOUND)
++    return 0;
++  else
++    return_set_error(-1, RtlNtStatusToDosError(cancel_status));
++}
++
++WEPOLL_INTERNAL int epoll_global_init(void);
++
++WEPOLL_INTERNAL int init(void);
++
++typedef struct port_state port_state_t;
++typedef struct queue queue_t;
++typedef struct sock_state sock_state_t;
++typedef struct ts_tree_node ts_tree_node_t;
++
++WEPOLL_INTERNAL port_state_t* port_new(HANDLE* iocp_handle_out);
++WEPOLL_INTERNAL int port_close(port_state_t* port_state);
++WEPOLL_INTERNAL int port_delete(port_state_t* port_state);
++
++WEPOLL_INTERNAL int port_wait(port_state_t* port_state,
++                              struct epoll_event* events,
++                              int maxevents,
++                              int timeout);
++
++WEPOLL_INTERNAL int port_ctl(port_state_t* port_state,
++                             int op,
++                             SOCKET sock,
++                             struct epoll_event* ev);
++
++WEPOLL_INTERNAL int port_register_socket(port_state_t* port_state,
++                                         sock_state_t* sock_state,
++                                         SOCKET socket);
++WEPOLL_INTERNAL void port_unregister_socket(port_state_t* port_state,
++                                            sock_state_t* sock_state);
++WEPOLL_INTERNAL sock_state_t* port_find_socket(port_state_t* port_state,
++                                               SOCKET socket);
++
++WEPOLL_INTERNAL void port_request_socket_update(port_state_t* port_state,
++                                                sock_state_t* sock_state);
++WEPOLL_INTERNAL void port_cancel_socket_update(port_state_t* port_state,
++                                               sock_state_t* sock_state);
++
++WEPOLL_INTERNAL void port_add_deleted_socket(port_state_t* port_state,
++                                             sock_state_t* sock_state);
++WEPOLL_INTERNAL void port_remove_deleted_socket(port_state_t* port_state,
++                                                sock_state_t* sock_state);
++
++WEPOLL_INTERNAL HANDLE port_get_iocp_handle(port_state_t* port_state);
++WEPOLL_INTERNAL queue_t* port_get_poll_group_queue(port_state_t* port_state);
++
++WEPOLL_INTERNAL port_state_t* port_state_from_handle_tree_node(
++    ts_tree_node_t* tree_node);
++WEPOLL_INTERNAL ts_tree_node_t* port_state_to_handle_tree_node(
++    port_state_t* port_state);
++
++/* The reflock is a special kind of lock that normally prevents a chunk of
++ * memory from being freed, but does allow the chunk of memory to eventually be
++ * released in a coordinated fashion.
++ *
++ * Under normal operation, threads increase and decrease the reference count,
++ * which are wait-free operations.
++ *
++ * Exactly once during the reflock's lifecycle, a thread holding a reference to
++ * the lock may "destroy" the lock; this operation blocks until all other
++ * threads holding a reference to the lock have dereferenced it. After
++ * "destroy" returns, the calling thread may assume that no other threads have
++ * a reference to the lock.
++ *
++ * Attemmpting to lock or destroy a lock after reflock_unref_and_destroy() has
++ * been called is invalid and results in undefined behavior. Therefore the user
++ * should use another lock to guarantee that this can't happen.
++ */
++
++typedef struct reflock {
++  volatile long state; /* 32-bit Interlocked APIs operate on `long` values. */
++} reflock_t;
++
++WEPOLL_INTERNAL int reflock_global_init(void);
++
++WEPOLL_INTERNAL void reflock_init(reflock_t* reflock);
++WEPOLL_INTERNAL void reflock_ref(reflock_t* reflock);
++WEPOLL_INTERNAL void reflock_unref(reflock_t* reflock);
++WEPOLL_INTERNAL void reflock_unref_and_destroy(reflock_t* reflock);
++
++#include <stdbool.h>
++
++/* N.b.: the tree functions do not set errno or LastError when they fail. Each
++ * of the API functions has at most one failure mode. It is up to the caller to
++ * set an appropriate error code when necessary. */
++
++typedef struct tree tree_t;
++typedef struct tree_node tree_node_t;
++
++typedef struct tree {
++  tree_node_t* root;
++} tree_t;
++
++typedef struct tree_node {
++  tree_node_t* left;
++  tree_node_t* right;
++  tree_node_t* parent;
++  uintptr_t key;
++  bool red;
++} tree_node_t;
++
++WEPOLL_INTERNAL void tree_init(tree_t* tree);
++WEPOLL_INTERNAL void tree_node_init(tree_node_t* node);
++
++WEPOLL_INTERNAL int tree_add(tree_t* tree, tree_node_t* node, uintptr_t key);
++WEPOLL_INTERNAL void tree_del(tree_t* tree, tree_node_t* node);
++
++WEPOLL_INTERNAL tree_node_t* tree_find(const tree_t* tree, uintptr_t key);
++WEPOLL_INTERNAL tree_node_t* tree_root(const tree_t* tree);
++
++typedef struct ts_tree {
++  tree_t tree;
++  SRWLOCK lock;
++} ts_tree_t;
++
++typedef struct ts_tree_node {
++  tree_node_t tree_node;
++  reflock_t reflock;
++} ts_tree_node_t;
++
++WEPOLL_INTERNAL void ts_tree_init(ts_tree_t* rtl);
++WEPOLL_INTERNAL void ts_tree_node_init(ts_tree_node_t* node);
++
++WEPOLL_INTERNAL int ts_tree_add(ts_tree_t* ts_tree,
++                                ts_tree_node_t* node,
++                                uintptr_t key);
++
++WEPOLL_INTERNAL ts_tree_node_t* ts_tree_del_and_ref(ts_tree_t* ts_tree,
++                                                    uintptr_t key);
++WEPOLL_INTERNAL ts_tree_node_t* ts_tree_find_and_ref(ts_tree_t* ts_tree,
++                                                     uintptr_t key);
++
++WEPOLL_INTERNAL void ts_tree_node_unref(ts_tree_node_t* node);
++WEPOLL_INTERNAL void ts_tree_node_unref_and_destroy(ts_tree_node_t* node);
++
++static ts_tree_t epoll__handle_tree;
++
++int epoll_global_init(void) {
++  ts_tree_init(&epoll__handle_tree);
++  return 0;
++}
++
++static HANDLE epoll__create(void) {
++  port_state_t* port_state;
++  HANDLE ephnd;
++  ts_tree_node_t* tree_node;
++
++  if (init() < 0)
++    return NULL;
++
++  port_state = port_new(&ephnd);
++  if (port_state == NULL)
++    return NULL;
++
++  tree_node = port_state_to_handle_tree_node(port_state);
++  if (ts_tree_add(&epoll__handle_tree, tree_node, (uintptr_t) ephnd) < 0) {
++    /* This should never happen. */
++    port_delete(port_state);
++    return_set_error(NULL, ERROR_ALREADY_EXISTS);
++  }
++
++  return ephnd;
++}
++
++HANDLE epoll_create(int size) {
++  if (size <= 0)
++    return_set_error(NULL, ERROR_INVALID_PARAMETER);
++
++  return epoll__create();
++}
++
++HANDLE epoll_create1(int flags) {
++  if (flags != 0)
++    return_set_error(NULL, ERROR_INVALID_PARAMETER);
++
++  return epoll__create();
++}
++
++int epoll_close(HANDLE ephnd) {
++  ts_tree_node_t* tree_node;
++  port_state_t* port_state;
++
++  if (init() < 0)
++    return -1;
++
++  tree_node = ts_tree_del_and_ref(&epoll__handle_tree, (uintptr_t) ephnd);
++  if (tree_node == NULL) {
++    err_set_win_error(ERROR_INVALID_PARAMETER);
++    goto err;
++  }
++
++  port_state = port_state_from_handle_tree_node(tree_node);
++  port_close(port_state);
++
++  ts_tree_node_unref_and_destroy(tree_node);
++
++  return port_delete(port_state);
++
++err:
++  err_check_handle(ephnd);
++  return -1;
++}
++
++int epoll_ctl(HANDLE ephnd, int op, SOCKET sock, struct epoll_event* ev) {
++  ts_tree_node_t* tree_node;
++  port_state_t* port_state;
++  int r;
++
++  if (init() < 0)
++    return -1;
++
++  tree_node = ts_tree_find_and_ref(&epoll__handle_tree, (uintptr_t) ephnd);
++  if (tree_node == NULL) {
++    err_set_win_error(ERROR_INVALID_PARAMETER);
++    goto err;
++  }
++
++  port_state = port_state_from_handle_tree_node(tree_node);
++  r = port_ctl(port_state, op, sock, ev);
++
++  ts_tree_node_unref(tree_node);
++
++  if (r < 0)
++    goto err;
++
++  return 0;
++
++err:
++  /* On Linux, in the case of epoll_ctl(), EBADF takes priority over other
++   * errors. Wepoll mimics this behavior. */
++  err_check_handle(ephnd);
++  err_check_handle((HANDLE) sock);
++  return -1;
++}
++
++int epoll_wait(HANDLE ephnd,
++               struct epoll_event* events,
++               int maxevents,
++               int timeout) {
++  ts_tree_node_t* tree_node;
++  port_state_t* port_state;
++  int num_events;
++
++  if (maxevents <= 0)
++    return_set_error(-1, ERROR_INVALID_PARAMETER);
++
++  if (init() < 0)
++    return -1;
++
++  tree_node = ts_tree_find_and_ref(&epoll__handle_tree, (uintptr_t) ephnd);
++  if (tree_node == NULL) {
++    err_set_win_error(ERROR_INVALID_PARAMETER);
++    goto err;
++  }
++
++  port_state = port_state_from_handle_tree_node(tree_node);
++  num_events = port_wait(port_state, events, maxevents, timeout);
++
++  ts_tree_node_unref(tree_node);
++
++  if (num_events < 0)
++    goto err;
++
++  return num_events;
++
++err:
++  err_check_handle(ephnd);
++  return -1;
++}
++
++#include <errno.h>
++
++#define ERR__ERRNO_MAPPINGS(X)               \
++  X(ERROR_ACCESS_DENIED, EACCES)             \
++  X(ERROR_ALREADY_EXISTS, EEXIST)            \
++  X(ERROR_BAD_COMMAND, EACCES)               \
++  X(ERROR_BAD_EXE_FORMAT, ENOEXEC)           \
++  X(ERROR_BAD_LENGTH, EACCES)                \
++  X(ERROR_BAD_NETPATH, ENOENT)               \
++  X(ERROR_BAD_NET_NAME, ENOENT)              \
++  X(ERROR_BAD_NET_RESP, ENETDOWN)            \
++  X(ERROR_BAD_PATHNAME, ENOENT)              \
++  X(ERROR_BROKEN_PIPE, EPIPE)                \
++  X(ERROR_CANNOT_MAKE, EACCES)               \
++  X(ERROR_COMMITMENT_LIMIT, ENOMEM)          \
++  X(ERROR_CONNECTION_ABORTED, ECONNABORTED)  \
++  X(ERROR_CONNECTION_ACTIVE, EISCONN)        \
++  X(ERROR_CONNECTION_REFUSED, ECONNREFUSED)  \
++  X(ERROR_CRC, EACCES)                       \
++  X(ERROR_DIR_NOT_EMPTY, ENOTEMPTY)          \
++  X(ERROR_DISK_FULL, ENOSPC)                 \
++  X(ERROR_DUP_NAME, EADDRINUSE)              \
++  X(ERROR_FILENAME_EXCED_RANGE, ENOENT)      \
++  X(ERROR_FILE_NOT_FOUND, ENOENT)            \
++  X(ERROR_GEN_FAILURE, EACCES)               \
++  X(ERROR_GRACEFUL_DISCONNECT, EPIPE)        \
++  X(ERROR_HOST_DOWN, EHOSTUNREACH)           \
++  X(ERROR_HOST_UNREACHABLE, EHOSTUNREACH)    \
++  X(ERROR_INSUFFICIENT_BUFFER, EFAULT)       \
++  X(ERROR_INVALID_ADDRESS, EADDRNOTAVAIL)    \
++  X(ERROR_INVALID_FUNCTION, EINVAL)          \
++  X(ERROR_INVALID_HANDLE, EBADF)             \
++  X(ERROR_INVALID_NETNAME, EADDRNOTAVAIL)    \
++  X(ERROR_INVALID_PARAMETER, EINVAL)         \
++  X(ERROR_INVALID_USER_BUFFER, EMSGSIZE)     \
++  X(ERROR_IO_PENDING, EINPROGRESS)           \
++  X(ERROR_LOCK_VIOLATION, EACCES)            \
++  X(ERROR_MORE_DATA, EMSGSIZE)               \
++  X(ERROR_NETNAME_DELETED, ECONNABORTED)     \
++  X(ERROR_NETWORK_ACCESS_DENIED, EACCES)     \
++  X(ERROR_NETWORK_BUSY, ENETDOWN)            \
++  X(ERROR_NETWORK_UNREACHABLE, ENETUNREACH)  \
++  X(ERROR_NOACCESS, EFAULT)                  \
++  X(ERROR_NONPAGED_SYSTEM_RESOURCES, ENOMEM) \
++  X(ERROR_NOT_ENOUGH_MEMORY, ENOMEM)         \
++  X(ERROR_NOT_ENOUGH_QUOTA, ENOMEM)          \
++  X(ERROR_NOT_FOUND, ENOENT)                 \
++  X(ERROR_NOT_LOCKED, EACCES)                \
++  X(ERROR_NOT_READY, EACCES)                 \
++  X(ERROR_NOT_SAME_DEVICE, EXDEV)            \
++  X(ERROR_NOT_SUPPORTED, ENOTSUP)            \
++  X(ERROR_NO_MORE_FILES, ENOENT)             \
++  X(ERROR_NO_SYSTEM_RESOURCES, ENOMEM)       \
++  X(ERROR_OPERATION_ABORTED, EINTR)          \
++  X(ERROR_OUT_OF_PAPER, EACCES)              \
++  X(ERROR_PAGED_SYSTEM_RESOURCES, ENOMEM)    \
++  X(ERROR_PAGEFILE_QUOTA, ENOMEM)            \
++  X(ERROR_PATH_NOT_FOUND, ENOENT)            \
++  X(ERROR_PIPE_NOT_CONNECTED, EPIPE)         \
++  X(ERROR_PORT_UNREACHABLE, ECONNRESET)      \
++  X(ERROR_PROTOCOL_UNREACHABLE, ENETUNREACH) \
++  X(ERROR_REM_NOT_LIST, ECONNREFUSED)        \
++  X(ERROR_REQUEST_ABORTED, EINTR)            \
++  X(ERROR_REQ_NOT_ACCEP, EWOULDBLOCK)        \
++  X(ERROR_SECTOR_NOT_FOUND, EACCES)          \
++  X(ERROR_SEM_TIMEOUT, ETIMEDOUT)            \
++  X(ERROR_SHARING_VIOLATION, EACCES)         \
++  X(ERROR_TOO_MANY_NAMES, ENOMEM)            \
++  X(ERROR_TOO_MANY_OPEN_FILES, EMFILE)       \
++  X(ERROR_UNEXP_NET_ERR, ECONNABORTED)       \
++  X(ERROR_WAIT_NO_CHILDREN, ECHILD)          \
++  X(ERROR_WORKING_SET_QUOTA, ENOMEM)         \
++  X(ERROR_WRITE_PROTECT, EACCES)             \
++  X(ERROR_WRONG_DISK, EACCES)                \
++  X(WSAEACCES, EACCES)                       \
++  X(WSAEADDRINUSE, EADDRINUSE)               \
++  X(WSAEADDRNOTAVAIL, EADDRNOTAVAIL)         \
++  X(WSAEAFNOSUPPORT, EAFNOSUPPORT)           \
++  X(WSAECONNABORTED, ECONNABORTED)           \
++  X(WSAECONNREFUSED, ECONNREFUSED)           \
++  X(WSAECONNRESET, ECONNRESET)               \
++  X(WSAEDISCON, EPIPE)                       \
++  X(WSAEFAULT, EFAULT)                       \
++  X(WSAEHOSTDOWN, EHOSTUNREACH)              \
++  X(WSAEHOSTUNREACH, EHOSTUNREACH)           \
++  X(WSAEINPROGRESS, EBUSY)                   \
++  X(WSAEINTR, EINTR)                         \
++  X(WSAEINVAL, EINVAL)                       \
++  X(WSAEISCONN, EISCONN)                     \
++  X(WSAEMSGSIZE, EMSGSIZE)                   \
++  X(WSAENETDOWN, ENETDOWN)                   \
++  X(WSAENETRESET, EHOSTUNREACH)              \
++  X(WSAENETUNREACH, ENETUNREACH)             \
++  X(WSAENOBUFS, ENOMEM)                      \
++  X(WSAENOTCONN, ENOTCONN)                   \
++  X(WSAENOTSOCK, ENOTSOCK)                   \
++  X(WSAEOPNOTSUPP, EOPNOTSUPP)               \
++  X(WSAEPROCLIM, ENOMEM)                     \
++  X(WSAESHUTDOWN, EPIPE)                     \
++  X(WSAETIMEDOUT, ETIMEDOUT)                 \
++  X(WSAEWOULDBLOCK, EWOULDBLOCK)             \
++  X(WSANOTINITIALISED, ENETDOWN)             \
++  X(WSASYSNOTREADY, ENETDOWN)                \
++  X(WSAVERNOTSUPPORTED, ENOSYS)
++
++static errno_t err__map_win_error_to_errno(DWORD error) {
++  switch (error) {
++#define X(error_sym, errno_sym) \
++  case error_sym:               \
++    return errno_sym;
++    ERR__ERRNO_MAPPINGS(X)
++#undef X
++  }
++  return EINVAL;
++}
++
++void err_map_win_error(void) {
++  errno = err__map_win_error_to_errno(GetLastError());
++}
++
++void err_set_win_error(DWORD error) {
++  SetLastError(error);
++  errno = err__map_win_error_to_errno(error);
++}
++
++int err_check_handle(HANDLE handle) {
++  DWORD flags;
++
++  /* GetHandleInformation() succeeds when passed INVALID_HANDLE_VALUE, so check
++   * for this condition explicitly. */
++  if (handle == INVALID_HANDLE_VALUE)
++    return_set_error(-1, ERROR_INVALID_HANDLE);
++
++  if (!GetHandleInformation(handle, &flags))
++    return_map_error(-1);
++
++  return 0;
++}
++
++#include <stddef.h>
++
++#define array_count(a) (sizeof(a) / (sizeof((a)[0])))
++
++#define container_of(ptr, type, member) \
++  ((type*) ((uintptr_t) (ptr) - offsetof(type, member)))
++
++#define unused_var(v) ((void) (v))
++
++/* Polyfill `inline` for older versions of msvc (up to Visual Studio 2013) */
++#if defined(_MSC_VER) && _MSC_VER < 1900
++#define inline __inline
++#endif
++
++WEPOLL_INTERNAL int ws_global_init(void);
++WEPOLL_INTERNAL SOCKET ws_get_base_socket(SOCKET socket);
++
++static bool init__done = false;
++static INIT_ONCE init__once = INIT_ONCE_STATIC_INIT;
++
++static BOOL CALLBACK init__once_callback(INIT_ONCE* once,
++                                         void* parameter,
++                                         void** context) {
++  unused_var(once);
++  unused_var(parameter);
++  unused_var(context);
++
++  /* N.b. that initialization order matters here. */
++  if (ws_global_init() < 0 || nt_global_init() < 0 ||
++      reflock_global_init() < 0 || epoll_global_init() < 0)
++    return FALSE;
++
++  init__done = true;
++  return TRUE;
++}
++
++int init(void) {
++  if (!init__done &&
++      !InitOnceExecuteOnce(&init__once, init__once_callback, NULL, NULL))
++    /* `InitOnceExecuteOnce()` itself is infallible, and it doesn't set any
++     * error code when the once-callback returns FALSE. We return -1 here to
++     * indicate that global initialization failed; the failing init function is
++     * resposible for setting `errno` and calling `SetLastError()`. */
++    return -1;
++
++  return 0;
++}
++
++/* Set up a workaround for the following problem:
++ *   FARPROC addr = GetProcAddress(...);
++ *   MY_FUNC func = (MY_FUNC) addr;          <-- GCC 8 warning/error.
++ *   MY_FUNC func = (MY_FUNC) (void*) addr;  <-- MSVC  warning/error.
++ * To compile cleanly with either compiler, do casts with this "bridge" type:
++ *   MY_FUNC func = (MY_FUNC) (nt__fn_ptr_cast_t) addr; */
++#ifdef __GNUC__
++typedef void* nt__fn_ptr_cast_t;
++#else
++typedef FARPROC nt__fn_ptr_cast_t;
++#endif
++
++#define X(return_type, attributes, name, parameters) \
++  WEPOLL_INTERNAL return_type(attributes* name) parameters = NULL;
++NT_NTDLL_IMPORT_LIST(X)
++#undef X
++
++int nt_global_init(void) {
++  HMODULE ntdll;
++  FARPROC fn_ptr;
++
++  ntdll = GetModuleHandleW(L"ntdll.dll");
++  if (ntdll == NULL)
++    return -1;
++
++#define X(return_type, attributes, name, parameters) \
++  fn_ptr = GetProcAddress(ntdll, #name);             \
++  if (fn_ptr == NULL)                                \
++    return -1;                                       \
++  name = (return_type(attributes*) parameters)(nt__fn_ptr_cast_t) fn_ptr;
++  NT_NTDLL_IMPORT_LIST(X)
++#undef X
++
++  return 0;
++}
++
++#include <string.h>
++
++typedef struct poll_group poll_group_t;
++
++typedef struct queue_node queue_node_t;
++
++WEPOLL_INTERNAL poll_group_t* poll_group_acquire(port_state_t* port);
++WEPOLL_INTERNAL void poll_group_release(poll_group_t* poll_group);
++
++WEPOLL_INTERNAL void poll_group_delete(poll_group_t* poll_group);
++
++WEPOLL_INTERNAL poll_group_t* poll_group_from_queue_node(
++    queue_node_t* queue_node);
++WEPOLL_INTERNAL HANDLE
++    poll_group_get_afd_device_handle(poll_group_t* poll_group);
++
++typedef struct queue_node {
++  queue_node_t* prev;
++  queue_node_t* next;
++} queue_node_t;
++
++typedef struct queue {
++  queue_node_t head;
++} queue_t;
++
++WEPOLL_INTERNAL void queue_init(queue_t* queue);
++WEPOLL_INTERNAL void queue_node_init(queue_node_t* node);
++
++WEPOLL_INTERNAL queue_node_t* queue_first(const queue_t* queue);
++WEPOLL_INTERNAL queue_node_t* queue_last(const queue_t* queue);
++
++WEPOLL_INTERNAL void queue_prepend(queue_t* queue, queue_node_t* node);
++WEPOLL_INTERNAL void queue_append(queue_t* queue, queue_node_t* node);
++WEPOLL_INTERNAL void queue_move_to_start(queue_t* queue, queue_node_t* node);
++WEPOLL_INTERNAL void queue_move_to_end(queue_t* queue, queue_node_t* node);
++WEPOLL_INTERNAL void queue_remove(queue_node_t* node);
++
++WEPOLL_INTERNAL bool queue_is_empty(const queue_t* queue);
++WEPOLL_INTERNAL bool queue_is_enqueued(const queue_node_t* node);
++
++#define POLL_GROUP__MAX_GROUP_SIZE 32
++
++typedef struct poll_group {
++  port_state_t* port_state;
++  queue_node_t queue_node;
++  HANDLE afd_device_handle;
++  size_t group_size;
++} poll_group_t;
++
++static poll_group_t* poll_group__new(port_state_t* port_state) {
++  HANDLE iocp_handle = port_get_iocp_handle(port_state);
++  queue_t* poll_group_queue = port_get_poll_group_queue(port_state);
++
++  poll_group_t* poll_group = malloc(sizeof *poll_group);
++  if (poll_group == NULL)
++    return_set_error(NULL, ERROR_NOT_ENOUGH_MEMORY);
++
++  memset(poll_group, 0, sizeof *poll_group);
++
++  queue_node_init(&poll_group->queue_node);
++  poll_group->port_state = port_state;
++
++  if (afd_create_device_handle(iocp_handle, &poll_group->afd_device_handle) <
++      0) {
++    free(poll_group);
++    return NULL;
++  }
++
++  queue_append(poll_group_queue, &poll_group->queue_node);
++
++  return poll_group;
++}
++
++void poll_group_delete(poll_group_t* poll_group) {
++  assert(poll_group->group_size == 0);
++  CloseHandle(poll_group->afd_device_handle);
++  queue_remove(&poll_group->queue_node);
++  free(poll_group);
++}
++
++poll_group_t* poll_group_from_queue_node(queue_node_t* queue_node) {
++  return container_of(queue_node, poll_group_t, queue_node);
++}
++
++HANDLE poll_group_get_afd_device_handle(poll_group_t* poll_group) {
++  return poll_group->afd_device_handle;
++}
++
++poll_group_t* poll_group_acquire(port_state_t* port_state) {
++  queue_t* poll_group_queue = port_get_poll_group_queue(port_state);
++  poll_group_t* poll_group =
++      !queue_is_empty(poll_group_queue)
++          ? container_of(
++                queue_last(poll_group_queue), poll_group_t, queue_node)
++          : NULL;
++
++  if (poll_group == NULL ||
++      poll_group->group_size >= POLL_GROUP__MAX_GROUP_SIZE)
++    poll_group = poll_group__new(port_state);
++  if (poll_group == NULL)
++    return NULL;
++
++  if (++poll_group->group_size == POLL_GROUP__MAX_GROUP_SIZE)
++    queue_move_to_start(poll_group_queue, &poll_group->queue_node);
++
++  return poll_group;
++}
++
++void poll_group_release(poll_group_t* poll_group) {
++  port_state_t* port_state = poll_group->port_state;
++  queue_t* poll_group_queue = port_get_poll_group_queue(port_state);
++
++  poll_group->group_size--;
++  assert(poll_group->group_size < POLL_GROUP__MAX_GROUP_SIZE);
++
++  queue_move_to_end(poll_group_queue, &poll_group->queue_node);
++
++  /* Poll groups are currently only freed when the epoll port is closed. */
++}
++
++WEPOLL_INTERNAL sock_state_t* sock_new(port_state_t* port_state,
++                                       SOCKET socket);
++WEPOLL_INTERNAL void sock_delete(port_state_t* port_state,
++                                 sock_state_t* sock_state);
++WEPOLL_INTERNAL void sock_force_delete(port_state_t* port_state,
++                                       sock_state_t* sock_state);
++
++WEPOLL_INTERNAL int sock_set_event(port_state_t* port_state,
++                                   sock_state_t* sock_state,
++                                   const struct epoll_event* ev);
++
++WEPOLL_INTERNAL int sock_update(port_state_t* port_state,
++                                sock_state_t* sock_state);
++WEPOLL_INTERNAL int sock_feed_event(port_state_t* port_state,
++                                    IO_STATUS_BLOCK* io_status_block,
++                                    struct epoll_event* ev);
++
++WEPOLL_INTERNAL sock_state_t* sock_state_from_queue_node(
++    queue_node_t* queue_node);
++WEPOLL_INTERNAL queue_node_t* sock_state_to_queue_node(
++    sock_state_t* sock_state);
++WEPOLL_INTERNAL sock_state_t* sock_state_from_tree_node(
++    tree_node_t* tree_node);
++WEPOLL_INTERNAL tree_node_t* sock_state_to_tree_node(sock_state_t* sock_state);
++
++#define PORT__MAX_ON_STACK_COMPLETIONS 256
++
++typedef struct port_state {
++  HANDLE iocp_handle;
++  tree_t sock_tree;
++  queue_t sock_update_queue;
++  queue_t sock_deleted_queue;
++  queue_t poll_group_queue;
++  ts_tree_node_t handle_tree_node;
++  CRITICAL_SECTION lock;
++  size_t active_poll_count;
++} port_state_t;
++
++static inline port_state_t* port__alloc(void) {
++  port_state_t* port_state = malloc(sizeof *port_state);
++  if (port_state == NULL)
++    return_set_error(NULL, ERROR_NOT_ENOUGH_MEMORY);
++
++  return port_state;
++}
++
++static inline void port__free(port_state_t* port) {
++  assert(port != NULL);
++  free(port);
++}
++
++static inline HANDLE port__create_iocp(void) {
++  HANDLE iocp_handle =
++      CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
++  if (iocp_handle == NULL)
++    return_map_error(NULL);
++
++  return iocp_handle;
++}
++
++port_state_t* port_new(HANDLE* iocp_handle_out) {
++  port_state_t* port_state;
++  HANDLE iocp_handle;
++
++  port_state = port__alloc();
++  if (port_state == NULL)
++    goto err1;
++
++  iocp_handle = port__create_iocp();
++  if (iocp_handle == NULL)
++    goto err2;
++
++  memset(port_state, 0, sizeof *port_state);
++
++  port_state->iocp_handle = iocp_handle;
++  tree_init(&port_state->sock_tree);
++  queue_init(&port_state->sock_update_queue);
++  queue_init(&port_state->sock_deleted_queue);
++  queue_init(&port_state->poll_group_queue);
++  ts_tree_node_init(&port_state->handle_tree_node);
++  InitializeCriticalSection(&port_state->lock);
++
++  *iocp_handle_out = iocp_handle;
++  return port_state;
++
++err2:
++  port__free(port_state);
++err1:
++  return NULL;
++}
++
++static inline int port__close_iocp(port_state_t* port_state) {
++  HANDLE iocp_handle = port_state->iocp_handle;
++  port_state->iocp_handle = NULL;
++
++  if (!CloseHandle(iocp_handle))
++    return_map_error(-1);
++
++  return 0;
++}
++
++int port_close(port_state_t* port_state) {
++  int result;
++
++  EnterCriticalSection(&port_state->lock);
++  result = port__close_iocp(port_state);
++  LeaveCriticalSection(&port_state->lock);
++
++  return result;
++}
++
++int port_delete(port_state_t* port_state) {
++  tree_node_t* tree_node;
++  queue_node_t* queue_node;
++
++  /* At this point the IOCP port should have been closed. */
++  assert(port_state->iocp_handle == NULL);
++
++  while ((tree_node = tree_root(&port_state->sock_tree)) != NULL) {
++    sock_state_t* sock_state = sock_state_from_tree_node(tree_node);
++    sock_force_delete(port_state, sock_state);
++  }
++
++  while ((queue_node = queue_first(&port_state->sock_deleted_queue)) != NULL) {
++    sock_state_t* sock_state = sock_state_from_queue_node(queue_node);
++    sock_force_delete(port_state, sock_state);
++  }
++
++  while ((queue_node = queue_first(&port_state->poll_group_queue)) != NULL) {
++    poll_group_t* poll_group = poll_group_from_queue_node(queue_node);
++    poll_group_delete(poll_group);
++  }
++
++  assert(queue_is_empty(&port_state->sock_update_queue));
++
++  DeleteCriticalSection(&port_state->lock);
++
++  port__free(port_state);
++
++  return 0;
++}
++
++static int port__update_events(port_state_t* port_state) {
++  queue_t* sock_update_queue = &port_state->sock_update_queue;
++
++  /* Walk the queue, submitting new poll requests for every socket that needs
++   * it. */
++  while (!queue_is_empty(sock_update_queue)) {
++    queue_node_t* queue_node = queue_first(sock_update_queue);
++    sock_state_t* sock_state = sock_state_from_queue_node(queue_node);
++
++    if (sock_update(port_state, sock_state) < 0)
++      return -1;
++
++    /* sock_update() removes the socket from the update queue. */
++  }
++
++  return 0;
++}
++
++static inline void port__update_events_if_polling(port_state_t* port_state) {
++  if (port_state->active_poll_count > 0)
++    port__update_events(port_state);
++}
++
++static inline int port__feed_events(port_state_t* port_state,
++                                    struct epoll_event* epoll_events,
++                                    OVERLAPPED_ENTRY* iocp_events,
++                                    DWORD iocp_event_count) {
++  int epoll_event_count = 0;
++  DWORD i;
++
++  for (i = 0; i < iocp_event_count; i++) {
++    IO_STATUS_BLOCK* io_status_block =
++        (IO_STATUS_BLOCK*) iocp_events[i].lpOverlapped;
++    struct epoll_event* ev = &epoll_events[epoll_event_count];
++
++    epoll_event_count += sock_feed_event(port_state, io_status_block, ev);
++  }
++
++  return epoll_event_count;
++}
++
++static inline int port__poll(port_state_t* port_state,
++                             struct epoll_event* epoll_events,
++                             OVERLAPPED_ENTRY* iocp_events,
++                             DWORD maxevents,
++                             DWORD timeout) {
++  DWORD completion_count;
++
++  if (port__update_events(port_state) < 0)
++    return -1;
++
++  port_state->active_poll_count++;
++
++  LeaveCriticalSection(&port_state->lock);
++
++  BOOL r = GetQueuedCompletionStatusEx(port_state->iocp_handle,
++                                       iocp_events,
++                                       maxevents,
++                                       &completion_count,
++                                       timeout,
++                                       FALSE);
++
++  EnterCriticalSection(&port_state->lock);
++
++  port_state->active_poll_count--;
++
++  if (!r)
++    return_map_error(-1);
++
++  return port__feed_events(
++      port_state, epoll_events, iocp_events, completion_count);
++}
++
++int port_wait(port_state_t* port_state,
++              struct epoll_event* events,
++              int maxevents,
++              int timeout) {
++  OVERLAPPED_ENTRY stack_iocp_events[PORT__MAX_ON_STACK_COMPLETIONS];
++  OVERLAPPED_ENTRY* iocp_events;
++  uint64_t due = 0;
++  DWORD gqcs_timeout;
++  int result;
++
++  /* Check whether `maxevents` is in range. */
++  if (maxevents <= 0)
++    return_set_error(-1, ERROR_INVALID_PARAMETER);
++
++  /* Decide whether the IOCP completion list can live on the stack, or allocate
++   * memory for it on the heap. */
++  if ((size_t) maxevents <= array_count(stack_iocp_events)) {
++    iocp_events = stack_iocp_events;
++  } else if ((iocp_events =
++                  malloc((size_t) maxevents * sizeof *iocp_events)) == NULL) {
++    iocp_events = stack_iocp_events;
++    maxevents = array_count(stack_iocp_events);
++  }
++
++  /* Compute the timeout for GetQueuedCompletionStatus, and the wait end
++   * time, if the user specified a timeout other than zero or infinite. */
++  if (timeout > 0) {
++    due = GetTickCount64() + (uint64_t) timeout;
++    gqcs_timeout = (DWORD) timeout;
++  } else if (timeout == 0) {
++    gqcs_timeout = 0;
++  } else {
++    gqcs_timeout = INFINITE;
++  }
++
++  EnterCriticalSection(&port_state->lock);
++
++  /* Dequeue completion packets until either at least one interesting event
++   * has been discovered, or the timeout is reached. */
++  for (;;) {
++    uint64_t now;
++
++    result = port__poll(
++        port_state, events, iocp_events, (DWORD) maxevents, gqcs_timeout);
++    if (result < 0 || result > 0)
++      break; /* Result, error, or time-out. */
++
++    if (timeout < 0)
++      continue; /* When timeout is negative, never time out. */
++
++    /* Update time. */
++    now = GetTickCount64();
++
++    /* Do not allow the due time to be in the past. */
++    if (now >= due) {
++      SetLastError(WAIT_TIMEOUT);
++      break;
++    }
++
++    /* Recompute time-out argument for GetQueuedCompletionStatus. */
++    gqcs_timeout = (DWORD)(due - now);
++  }
++
++  port__update_events_if_polling(port_state);
++
++  LeaveCriticalSection(&port_state->lock);
++
++  if (iocp_events != stack_iocp_events)
++    free(iocp_events);
++
++  if (result >= 0)
++    return result;
++  else if (GetLastError() == WAIT_TIMEOUT)
++    return 0;
++  else
++    return -1;
++}
++
++static inline int port__ctl_add(port_state_t* port_state,
++                                SOCKET sock,
++                                struct epoll_event* ev) {
++  sock_state_t* sock_state = sock_new(port_state, sock);
++  if (sock_state == NULL)
++    return -1;
++
++  if (sock_set_event(port_state, sock_state, ev) < 0) {
++    sock_delete(port_state, sock_state);
++    return -1;
++  }
++
++  port__update_events_if_polling(port_state);
++
++  return 0;
++}
++
++static inline int port__ctl_mod(port_state_t* port_state,
++                                SOCKET sock,
++                                struct epoll_event* ev) {
++  sock_state_t* sock_state = port_find_socket(port_state, sock);
++  if (sock_state == NULL)
++    return -1;
++
++  if (sock_set_event(port_state, sock_state, ev) < 0)
++    return -1;
++
++  port__update_events_if_polling(port_state);
++
++  return 0;
++}
++
++static inline int port__ctl_del(port_state_t* port_state, SOCKET sock) {
++  sock_state_t* sock_state = port_find_socket(port_state, sock);
++  if (sock_state == NULL)
++    return -1;
++
++  sock_delete(port_state, sock_state);
++
++  return 0;
++}
++
++static inline int port__ctl_op(port_state_t* port_state,
++                               int op,
++                               SOCKET sock,
++                               struct epoll_event* ev) {
++  switch (op) {
++    case EPOLL_CTL_ADD:
++      return port__ctl_add(port_state, sock, ev);
++    case EPOLL_CTL_MOD:
++      return port__ctl_mod(port_state, sock, ev);
++    case EPOLL_CTL_DEL:
++      return port__ctl_del(port_state, sock);
++    default:
++      return_set_error(-1, ERROR_INVALID_PARAMETER);
++  }
++}
++
++int port_ctl(port_state_t* port_state,
++             int op,
++             SOCKET sock,
++             struct epoll_event* ev) {
++  int result;
++
++  EnterCriticalSection(&port_state->lock);
++  result = port__ctl_op(port_state, op, sock, ev);
++  LeaveCriticalSection(&port_state->lock);
++
++  return result;
++}
++
++int port_register_socket(port_state_t* port_state,
++                         sock_state_t* sock_state,
++                         SOCKET socket) {
++  if (tree_add(&port_state->sock_tree,
++               sock_state_to_tree_node(sock_state),
++               socket) < 0)
++    return_set_error(-1, ERROR_ALREADY_EXISTS);
++  return 0;
++}
++
++void port_unregister_socket(port_state_t* port_state,
++                            sock_state_t* sock_state) {
++  tree_del(&port_state->sock_tree, sock_state_to_tree_node(sock_state));
++}
++
++sock_state_t* port_find_socket(port_state_t* port_state, SOCKET socket) {
++  tree_node_t* tree_node = tree_find(&port_state->sock_tree, socket);
++  if (tree_node == NULL)
++    return_set_error(NULL, ERROR_NOT_FOUND);
++  return sock_state_from_tree_node(tree_node);
++}
++
++void port_request_socket_update(port_state_t* port_state,
++                                sock_state_t* sock_state) {
++  if (queue_is_enqueued(sock_state_to_queue_node(sock_state)))
++    return;
++  queue_append(&port_state->sock_update_queue,
++               sock_state_to_queue_node(sock_state));
++}
++
++void port_cancel_socket_update(port_state_t* port_state,
++                               sock_state_t* sock_state) {
++  unused_var(port_state);
++  if (!queue_is_enqueued(sock_state_to_queue_node(sock_state)))
++    return;
++  queue_remove(sock_state_to_queue_node(sock_state));
++}
++
++void port_add_deleted_socket(port_state_t* port_state,
++                             sock_state_t* sock_state) {
++  if (queue_is_enqueued(sock_state_to_queue_node(sock_state)))
++    return;
++  queue_append(&port_state->sock_deleted_queue,
++               sock_state_to_queue_node(sock_state));
++}
++
++void port_remove_deleted_socket(port_state_t* port_state,
++                                sock_state_t* sock_state) {
++  unused_var(port_state);
++  if (!queue_is_enqueued(sock_state_to_queue_node(sock_state)))
++    return;
++  queue_remove(sock_state_to_queue_node(sock_state));
++}
++
++HANDLE port_get_iocp_handle(port_state_t* port_state) {
++  assert(port_state->iocp_handle != NULL);
++  return port_state->iocp_handle;
++}
++
++queue_t* port_get_poll_group_queue(port_state_t* port_state) {
++  return &port_state->poll_group_queue;
++}
++
++port_state_t* port_state_from_handle_tree_node(ts_tree_node_t* tree_node) {
++  return container_of(tree_node, port_state_t, handle_tree_node);
++}
++
++ts_tree_node_t* port_state_to_handle_tree_node(port_state_t* port_state) {
++  return &port_state->handle_tree_node;
++}
++
++void queue_init(queue_t* queue) {
++  queue_node_init(&queue->head);
++}
++
++void queue_node_init(queue_node_t* node) {
++  node->prev = node;
++  node->next = node;
++}
++
++static inline void queue__detach_node(queue_node_t* node) {
++  node->prev->next = node->next;
++  node->next->prev = node->prev;
++}
++
++queue_node_t* queue_first(const queue_t* queue) {
++  return !queue_is_empty(queue) ? queue->head.next : NULL;
++}
++
++queue_node_t* queue_last(const queue_t* queue) {
++  return !queue_is_empty(queue) ? queue->head.prev : NULL;
++}
++
++void queue_prepend(queue_t* queue, queue_node_t* node) {
++  node->next = queue->head.next;
++  node->prev = &queue->head;
++  node->next->prev = node;
++  queue->head.next = node;
++}
++
++void queue_append(queue_t* queue, queue_node_t* node) {
++  node->next = &queue->head;
++  node->prev = queue->head.prev;
++  node->prev->next = node;
++  queue->head.prev = node;
++}
++
++void queue_move_to_start(queue_t* queue, queue_node_t* node) {
++  queue__detach_node(node);
++  queue_prepend(queue, node);
++}
++
++void queue_move_to_end(queue_t* queue, queue_node_t* node) {
++  queue__detach_node(node);
++  queue_append(queue, node);
++}
++
++void queue_remove(queue_node_t* node) {
++  queue__detach_node(node);
++  queue_node_init(node);
++}
++
++bool queue_is_empty(const queue_t* queue) {
++  return !queue_is_enqueued(&queue->head);
++}
++
++bool queue_is_enqueued(const queue_node_t* node) {
++  return node->prev != node;
++}
++
++#define REFLOCK__REF          ((long) 0x00000001UL)
++#define REFLOCK__REF_MASK     ((long) 0x0fffffffUL)
++#define REFLOCK__DESTROY      ((long) 0x10000000UL)
++#define REFLOCK__DESTROY_MASK ((long) 0xf0000000UL)
++#define REFLOCK__POISON       ((long) 0x300dead0UL)
++
++static HANDLE reflock__keyed_event = NULL;
++
++int reflock_global_init(void) {
++  NTSTATUS status = NtCreateKeyedEvent(
++      &reflock__keyed_event, KEYEDEVENT_ALL_ACCESS, NULL, 0);
++  if (status != STATUS_SUCCESS)
++    return_set_error(-1, RtlNtStatusToDosError(status));
++  return 0;
++}
++
++void reflock_init(reflock_t* reflock) {
++  reflock->state = 0;
++}
++
++static void reflock__signal_event(void* address) {
++  NTSTATUS status =
++      NtReleaseKeyedEvent(reflock__keyed_event, address, FALSE, NULL);
++  if (status != STATUS_SUCCESS)
++    abort();
++}
++
++static void reflock__await_event(void* address) {
++  NTSTATUS status =
++      NtWaitForKeyedEvent(reflock__keyed_event, address, FALSE, NULL);
++  if (status != STATUS_SUCCESS)
++    abort();
++}
++
++void reflock_ref(reflock_t* reflock) {
++  long state = InterlockedAdd(&reflock->state, REFLOCK__REF);
++
++  /* Verify that the counter didn't overflow and the lock isn't destroyed. */
++  assert((state & REFLOCK__DESTROY_MASK) == 0);
++  unused_var(state);
++}
++
++void reflock_unref(reflock_t* reflock) {
++  long state = InterlockedAdd(&reflock->state, -REFLOCK__REF);
++
++  /* Verify that the lock was referenced and not already destroyed. */
++  assert((state & REFLOCK__DESTROY_MASK & ~REFLOCK__DESTROY) == 0);
++
++  if (state == REFLOCK__DESTROY)
++    reflock__signal_event(reflock);
++}
++
++void reflock_unref_and_destroy(reflock_t* reflock) {
++  long state =
++      InterlockedAdd(&reflock->state, REFLOCK__DESTROY - REFLOCK__REF);
++  long ref_count = state & REFLOCK__REF_MASK;
++
++  /* Verify that the lock was referenced and not already destroyed. */
++  assert((state & REFLOCK__DESTROY_MASK) == REFLOCK__DESTROY);
++
++  if (ref_count != 0)
++    reflock__await_event(reflock);
++
++  state = InterlockedExchange(&reflock->state, REFLOCK__POISON);
++  assert(state == REFLOCK__DESTROY);
++}
++
++#define SOCK__KNOWN_EPOLL_EVENTS                                       \
++  (EPOLLIN | EPOLLPRI | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDNORM | \
++   EPOLLRDBAND | EPOLLWRNORM | EPOLLWRBAND | EPOLLMSG | EPOLLRDHUP)
++
++typedef enum sock__poll_status {
++  SOCK__POLL_IDLE = 0,
++  SOCK__POLL_PENDING,
++  SOCK__POLL_CANCELLED
++} sock__poll_status_t;
++
++typedef struct sock_state {
++  IO_STATUS_BLOCK io_status_block;
++  AFD_POLL_INFO poll_info;
++  queue_node_t queue_node;
++  tree_node_t tree_node;
++  poll_group_t* poll_group;
++  SOCKET base_socket;
++  epoll_data_t user_data;
++  uint32_t user_events;
++  uint32_t pending_events;
++  sock__poll_status_t poll_status;
++  bool delete_pending;
++} sock_state_t;
++
++static inline sock_state_t* sock__alloc(void) {
++  sock_state_t* sock_state = malloc(sizeof *sock_state);
++  if (sock_state == NULL)
++    return_set_error(NULL, ERROR_NOT_ENOUGH_MEMORY);
++  return sock_state;
++}
++
++static inline void sock__free(sock_state_t* sock_state) {
++  assert(sock_state != NULL);
++  free(sock_state);
++}
++
++static inline int sock__cancel_poll(sock_state_t* sock_state) {
++  assert(sock_state->poll_status == SOCK__POLL_PENDING);
++
++  if (afd_cancel_poll(poll_group_get_afd_device_handle(sock_state->poll_group),
++                      &sock_state->io_status_block) < 0)
++    return -1;
++
++  sock_state->poll_status = SOCK__POLL_CANCELLED;
++  sock_state->pending_events = 0;
++  return 0;
++}
++
++sock_state_t* sock_new(port_state_t* port_state, SOCKET socket) {
++  SOCKET base_socket;
++  poll_group_t* poll_group;
++  sock_state_t* sock_state;
++
++  if (socket == 0 || socket == INVALID_SOCKET)
++    return_set_error(NULL, ERROR_INVALID_HANDLE);
++
++  base_socket = ws_get_base_socket(socket);
++  if (base_socket == INVALID_SOCKET)
++    return NULL;
++
++  poll_group = poll_group_acquire(port_state);
++  if (poll_group == NULL)
++    return NULL;
++
++  sock_state = sock__alloc();
++  if (sock_state == NULL)
++    goto err1;
++
++  memset(sock_state, 0, sizeof *sock_state);
++
++  sock_state->base_socket = base_socket;
++  sock_state->poll_group = poll_group;
++
++  tree_node_init(&sock_state->tree_node);
++  queue_node_init(&sock_state->queue_node);
++
++  if (port_register_socket(port_state, sock_state, socket) < 0)
++    goto err2;
++
++  return sock_state;
++
++err2:
++  sock__free(sock_state);
++err1:
++  poll_group_release(poll_group);
++
++  return NULL;
++}
++
++static int sock__delete(port_state_t* port_state,
++                        sock_state_t* sock_state,
++                        bool force) {
++  if (!sock_state->delete_pending) {
++    if (sock_state->poll_status == SOCK__POLL_PENDING)
++      sock__cancel_poll(sock_state);
++
++    port_cancel_socket_update(port_state, sock_state);
++    port_unregister_socket(port_state, sock_state);
++
++    sock_state->delete_pending = true;
++  }
++
++  /* If the poll request still needs to complete, the sock_state object can't
++   * be free()d yet. `sock_feed_event()` or `port_close()` will take care
++   * of this later. */
++  if (force || sock_state->poll_status == SOCK__POLL_IDLE) {
++    /* Free the sock_state now. */
++    port_remove_deleted_socket(port_state, sock_state);
++    poll_group_release(sock_state->poll_group);
++    sock__free(sock_state);
++  } else {
++    /* Free the socket later. */
++    port_add_deleted_socket(port_state, sock_state);
++  }
++
++  return 0;
++}
++
++void sock_delete(port_state_t* port_state, sock_state_t* sock_state) {
++  sock__delete(port_state, sock_state, false);
++}
++
++void sock_force_delete(port_state_t* port_state, sock_state_t* sock_state) {
++  sock__delete(port_state, sock_state, true);
++}
++
++int sock_set_event(port_state_t* port_state,
++                   sock_state_t* sock_state,
++                   const struct epoll_event* ev) {
++  /* EPOLLERR and EPOLLHUP are always reported, even when not requested by the
++   * caller. However they are disabled after a event has been reported for a
++   * socket for which the EPOLLONESHOT flag was set. */
++  uint32_t events = ev->events | EPOLLERR | EPOLLHUP;
++
++  sock_state->user_events = events;
++  sock_state->user_data = ev->data;
++
++  if ((events & SOCK__KNOWN_EPOLL_EVENTS & ~sock_state->pending_events) != 0)
++    port_request_socket_update(port_state, sock_state);
++
++  return 0;
++}
++
++static inline DWORD sock__epoll_events_to_afd_events(uint32_t epoll_events) {
++  /* Always monitor for AFD_POLL_LOCAL_CLOSE, which is triggered when the
++   * socket is closed with closesocket() or CloseHandle(). */
++  DWORD afd_events = AFD_POLL_LOCAL_CLOSE;
++
++  if (epoll_events & (EPOLLIN | EPOLLRDNORM))
++    afd_events |= AFD_POLL_RECEIVE | AFD_POLL_ACCEPT;
++  if (epoll_events & (EPOLLPRI | EPOLLRDBAND))
++    afd_events |= AFD_POLL_RECEIVE_EXPEDITED;
++  if (epoll_events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND))
++    afd_events |= AFD_POLL_SEND;
++  if (epoll_events & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP))
++    afd_events |= AFD_POLL_DISCONNECT;
++  if (epoll_events & EPOLLHUP)
++    afd_events |= AFD_POLL_ABORT;
++  if (epoll_events & EPOLLERR)
++    afd_events |= AFD_POLL_CONNECT_FAIL;
++
++  return afd_events;
++}
++
++static inline uint32_t sock__afd_events_to_epoll_events(DWORD afd_events) {
++  uint32_t epoll_events = 0;
++
++  if (afd_events & (AFD_POLL_RECEIVE | AFD_POLL_ACCEPT))
++    epoll_events |= EPOLLIN | EPOLLRDNORM;
++  if (afd_events & AFD_POLL_RECEIVE_EXPEDITED)
++    epoll_events |= EPOLLPRI | EPOLLRDBAND;
++  if (afd_events & AFD_POLL_SEND)
++    epoll_events |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
++  if (afd_events & AFD_POLL_DISCONNECT)
++    epoll_events |= EPOLLIN | EPOLLRDNORM | EPOLLRDHUP;
++  if (afd_events & AFD_POLL_ABORT)
++    epoll_events |= EPOLLHUP;
++  if (afd_events & AFD_POLL_CONNECT_FAIL)
++    /* Linux reports all these events after connect() has failed. */
++    epoll_events |=
++        EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLRDNORM | EPOLLWRNORM | EPOLLRDHUP;
++
++  return epoll_events;
++}
++
++int sock_update(port_state_t* port_state, sock_state_t* sock_state) {
++  assert(!sock_state->delete_pending);
++
++  if ((sock_state->poll_status == SOCK__POLL_PENDING) &&
++      (sock_state->user_events & SOCK__KNOWN_EPOLL_EVENTS &
++       ~sock_state->pending_events) == 0) {
++    /* All the events the user is interested in are already being monitored by
++     * the pending poll operation. It might spuriously complete because of an
++     * event that we're no longer interested in; when that happens we'll submit
++     * a new poll operation with the updated event mask. */
++
++  } else if (sock_state->poll_status == SOCK__POLL_PENDING) {
++    /* A poll operation is already pending, but it's not monitoring for all the
++     * events that the user is interested in. Therefore, cancel the pending
++     * poll operation; when we receive it's completion package, a new poll
++     * operation will be submitted with the correct event mask. */
++    if (sock__cancel_poll(sock_state) < 0)
++      return -1;
++
++  } else if (sock_state->poll_status == SOCK__POLL_CANCELLED) {
++    /* The poll operation has already been cancelled, we're still waiting for
++     * it to return. For now, there's nothing that needs to be done. */
++
++  } else if (sock_state->poll_status == SOCK__POLL_IDLE) {
++    /* No poll operation is pending; start one. */
++    sock_state->poll_info.Exclusive = FALSE;
++    sock_state->poll_info.NumberOfHandles = 1;
++    sock_state->poll_info.Timeout.QuadPart = INT64_MAX;
++    sock_state->poll_info.Handles[0].Handle = (HANDLE) sock_state->base_socket;
++    sock_state->poll_info.Handles[0].Status = 0;
++    sock_state->poll_info.Handles[0].Events =
++        sock__epoll_events_to_afd_events(sock_state->user_events);
++
++    if (afd_poll(poll_group_get_afd_device_handle(sock_state->poll_group),
++                 &sock_state->poll_info,
++                 &sock_state->io_status_block) < 0) {
++      switch (GetLastError()) {
++        case ERROR_IO_PENDING:
++          /* Overlapped poll operation in progress; this is expected. */
++          break;
++        case ERROR_INVALID_HANDLE:
++          /* Socket closed; it'll be dropped from the epoll set. */
++          return sock__delete(port_state, sock_state, false);
++        default:
++          /* Other errors are propagated to the caller. */
++          return_map_error(-1);
++      }
++    }
++
++    /* The poll request was successfully submitted. */
++    sock_state->poll_status = SOCK__POLL_PENDING;
++    sock_state->pending_events = sock_state->user_events;
++
++  } else {
++    /* Unreachable. */
++    assert(false);
++  }
++
++  port_cancel_socket_update(port_state, sock_state);
++  return 0;
++}
++
++int sock_feed_event(port_state_t* port_state,
++                    IO_STATUS_BLOCK* io_status_block,
++                    struct epoll_event* ev) {
++  sock_state_t* sock_state =
++      container_of(io_status_block, sock_state_t, io_status_block);
++  AFD_POLL_INFO* poll_info = &sock_state->poll_info;
++  uint32_t epoll_events = 0;
++
++  sock_state->poll_status = SOCK__POLL_IDLE;
++  sock_state->pending_events = 0;
++
++  if (sock_state->delete_pending) {
++    /* Socket has been deleted earlier and can now be freed. */
++    return sock__delete(port_state, sock_state, false);
++
++  } else if (io_status_block->Status == STATUS_CANCELLED) {
++    /* The poll request was cancelled by CancelIoEx. */
++
++  } else if (!NT_SUCCESS(io_status_block->Status)) {
++    /* The overlapped request itself failed in an unexpected way. */
++    epoll_events = EPOLLERR;
++
++  } else if (poll_info->NumberOfHandles < 1) {
++    /* This poll operation succeeded but didn't report any socket events. */
++
++  } else if (poll_info->Handles[0].Events & AFD_POLL_LOCAL_CLOSE) {
++    /* The poll operation reported that the socket was closed. */
++    return sock__delete(port_state, sock_state, false);
++
++  } else {
++    /* Events related to our socket were reported. */
++    epoll_events =
++        sock__afd_events_to_epoll_events(poll_info->Handles[0].Events);
++  }
++
++  /* Requeue the socket so a new poll request will be submitted. */
++  port_request_socket_update(port_state, sock_state);
++
++  /* Filter out events that the user didn't ask for. */
++  epoll_events &= sock_state->user_events;
++
++  /* Return if there are no epoll events to report. */
++  if (epoll_events == 0)
++    return 0;
++
++  /* If the the socket has the EPOLLONESHOT flag set, unmonitor all events,
++   * even EPOLLERR and EPOLLHUP. But always keep looking for closed sockets. */
++  if (sock_state->user_events & EPOLLONESHOT)
++    sock_state->user_events = 0;
++
++  ev->data = sock_state->user_data;
++  ev->events = epoll_events;
++  return 1;
++}
++
++sock_state_t* sock_state_from_queue_node(queue_node_t* queue_node) {
++  return container_of(queue_node, sock_state_t, queue_node);
++}
++
++queue_node_t* sock_state_to_queue_node(sock_state_t* sock_state) {
++  return &sock_state->queue_node;
++}
++
++sock_state_t* sock_state_from_tree_node(tree_node_t* tree_node) {
++  return container_of(tree_node, sock_state_t, tree_node);
++}
++
++tree_node_t* sock_state_to_tree_node(sock_state_t* sock_state) {
++  return &sock_state->tree_node;
++}
++
++void ts_tree_init(ts_tree_t* ts_tree) {
++  tree_init(&ts_tree->tree);
++  InitializeSRWLock(&ts_tree->lock);
++}
++
++void ts_tree_node_init(ts_tree_node_t* node) {
++  tree_node_init(&node->tree_node);
++  reflock_init(&node->reflock);
++}
++
++int ts_tree_add(ts_tree_t* ts_tree, ts_tree_node_t* node, uintptr_t key) {
++  int r;
++
++  AcquireSRWLockExclusive(&ts_tree->lock);
++  r = tree_add(&ts_tree->tree, &node->tree_node, key);
++  ReleaseSRWLockExclusive(&ts_tree->lock);
++
++  return r;
++}
++
++static inline ts_tree_node_t* ts_tree__find_node(ts_tree_t* ts_tree,
++                                                 uintptr_t key) {
++  tree_node_t* tree_node = tree_find(&ts_tree->tree, key);
++  if (tree_node == NULL)
++    return NULL;
++
++  return container_of(tree_node, ts_tree_node_t, tree_node);
++}
++
++ts_tree_node_t* ts_tree_del_and_ref(ts_tree_t* ts_tree, uintptr_t key) {
++  ts_tree_node_t* ts_tree_node;
++
++  AcquireSRWLockExclusive(&ts_tree->lock);
++
++  ts_tree_node = ts_tree__find_node(ts_tree, key);
++  if (ts_tree_node != NULL) {
++    tree_del(&ts_tree->tree, &ts_tree_node->tree_node);
++    reflock_ref(&ts_tree_node->reflock);
++  }
++
++  ReleaseSRWLockExclusive(&ts_tree->lock);
++
++  return ts_tree_node;
++}
++
++ts_tree_node_t* ts_tree_find_and_ref(ts_tree_t* ts_tree, uintptr_t key) {
++  ts_tree_node_t* ts_tree_node;
++
++  AcquireSRWLockShared(&ts_tree->lock);
++
++  ts_tree_node = ts_tree__find_node(ts_tree, key);
++  if (ts_tree_node != NULL)
++    reflock_ref(&ts_tree_node->reflock);
++
++  ReleaseSRWLockShared(&ts_tree->lock);
++
++  return ts_tree_node;
++}
++
++void ts_tree_node_unref(ts_tree_node_t* node) {
++  reflock_unref(&node->reflock);
++}
++
++void ts_tree_node_unref_and_destroy(ts_tree_node_t* node) {
++  reflock_unref_and_destroy(&node->reflock);
++}
++
++void tree_init(tree_t* tree) {
++  memset(tree, 0, sizeof *tree);
++}
++
++void tree_node_init(tree_node_t* node) {
++  memset(node, 0, sizeof *node);
++}
++
++#define TREE__ROTATE(cis, trans)   \
++  tree_node_t* p = node;           \
++  tree_node_t* q = node->trans;    \
++  tree_node_t* parent = p->parent; \
++                                   \
++  if (parent) {                    \
++    if (parent->left == p)         \
++      parent->left = q;            \
++    else                           \
++      parent->right = q;           \
++  } else {                         \
++    tree->root = q;                \
++  }                                \
++                                   \
++  q->parent = parent;              \
++  p->parent = q;                   \
++  p->trans = q->cis;               \
++  if (p->trans)                    \
++    p->trans->parent = p;          \
++  q->cis = p;
++
++static inline void tree__rotate_left(tree_t* tree, tree_node_t* node) {
++  TREE__ROTATE(left, right)
++}
++
++static inline void tree__rotate_right(tree_t* tree, tree_node_t* node) {
++  TREE__ROTATE(right, left)
++}
++
++#define TREE__INSERT_OR_DESCEND(side) \
++  if (parent->side) {                 \
++    parent = parent->side;            \
++  } else {                            \
++    parent->side = node;              \
++    break;                            \
++  }
++
++#define TREE__REBALANCE_AFTER_INSERT(cis, trans) \
++  tree_node_t* grandparent = parent->parent;     \
++  tree_node_t* uncle = grandparent->trans;       \
++                                                 \
++  if (uncle && uncle->red) {                     \
++    parent->red = uncle->red = false;            \
++    grandparent->red = true;                     \
++    node = grandparent;                          \
++  } else {                                       \
++    if (node == parent->trans) {                 \
++      tree__rotate_##cis(tree, parent);          \
++      node = parent;                             \
++      parent = node->parent;                     \
++    }                                            \
++    parent->red = false;                         \
++    grandparent->red = true;                     \
++    tree__rotate_##trans(tree, grandparent);     \
++  }
++
++int tree_add(tree_t* tree, tree_node_t* node, uintptr_t key) {
++  tree_node_t* parent;
++
++  parent = tree->root;
++  if (parent) {
++    for (;;) {
++      if (key < parent->key) {
++        TREE__INSERT_OR_DESCEND(left)
++      } else if (key > parent->key) {
++        TREE__INSERT_OR_DESCEND(right)
++      } else {
++        return -1;
++      }
++    }
++  } else {
++    tree->root = node;
++  }
++
++  node->key = key;
++  node->left = node->right = NULL;
++  node->parent = parent;
++  node->red = true;
++
++  for (; parent && parent->red; parent = node->parent) {
++    if (parent == parent->parent->left) {
++      TREE__REBALANCE_AFTER_INSERT(left, right)
++    } else {
++      TREE__REBALANCE_AFTER_INSERT(right, left)
++    }
++  }
++  tree->root->red = false;
++
++  return 0;
++}
++
++#define TREE__REBALANCE_AFTER_REMOVE(cis, trans)   \
++  tree_node_t* sibling = parent->trans;            \
++                                                   \
++  if (sibling->red) {                              \
++    sibling->red = false;                          \
++    parent->red = true;                            \
++    tree__rotate_##cis(tree, parent);              \
++    sibling = parent->trans;                       \
++  }                                                \
++  if ((sibling->left && sibling->left->red) ||     \
++      (sibling->right && sibling->right->red)) {   \
++    if (!sibling->trans || !sibling->trans->red) { \
++      sibling->cis->red = false;                   \
++      sibling->red = true;                         \
++      tree__rotate_##trans(tree, sibling);         \
++      sibling = parent->trans;                     \
++    }                                              \
++    sibling->red = parent->red;                    \
++    parent->red = sibling->trans->red = false;     \
++    tree__rotate_##cis(tree, parent);              \
++    node = tree->root;                             \
++    break;                                         \
++  }                                                \
++  sibling->red = true;
++
++void tree_del(tree_t* tree, tree_node_t* node) {
++  tree_node_t* parent = node->parent;
++  tree_node_t* left = node->left;
++  tree_node_t* right = node->right;
++  tree_node_t* next;
++  bool red;
++
++  if (!left) {
++    next = right;
++  } else if (!right) {
++    next = left;
++  } else {
++    next = right;
++    while (next->left)
++      next = next->left;
++  }
++
++  if (parent) {
++    if (parent->left == node)
++      parent->left = next;
++    else
++      parent->right = next;
++  } else {
++    tree->root = next;
++  }
++
++  if (left && right) {
++    red = next->red;
++    next->red = node->red;
++    next->left = left;
++    left->parent = next;
++    if (next != right) {
++      parent = next->parent;
++      next->parent = node->parent;
++      node = next->right;
++      parent->left = node;
++      next->right = right;
++      right->parent = next;
++    } else {
++      next->parent = parent;
++      parent = next;
++      node = next->right;
++    }
++  } else {
++    red = node->red;
++    node = next;
++  }
++
++  if (node)
++    node->parent = parent;
++  if (red)
++    return;
++  if (node && node->red) {
++    node->red = false;
++    return;
++  }
++
++  do {
++    if (node == tree->root)
++      break;
++    if (node == parent->left) {
++      TREE__REBALANCE_AFTER_REMOVE(left, right)
++    } else {
++      TREE__REBALANCE_AFTER_REMOVE(right, left)
++    }
++    node = parent;
++    parent = parent->parent;
++  } while (!node->red);
++
++  if (node)
++    node->red = false;
++}
++
++tree_node_t* tree_find(const tree_t* tree, uintptr_t key) {
++  tree_node_t* node = tree->root;
++  while (node) {
++    if (key < node->key)
++      node = node->left;
++    else if (key > node->key)
++      node = node->right;
++    else
++      return node;
++  }
++  return NULL;
++}
++
++tree_node_t* tree_root(const tree_t* tree) {
++  return tree->root;
++}
++
++#ifndef SIO_BSP_HANDLE_POLL
++#define SIO_BSP_HANDLE_POLL 0x4800001D
++#endif
++
++#ifndef SIO_BASE_HANDLE
++#define SIO_BASE_HANDLE 0x48000022
++#endif
++
++int ws_global_init(void) {
++  int r;
++  WSADATA wsa_data;
++
++  r = WSAStartup(MAKEWORD(2, 2), &wsa_data);
++  if (r != 0)
++    return_set_error(-1, (DWORD) r);
++
++  return 0;
++}
++
++static inline SOCKET ws__ioctl_get_bsp_socket(SOCKET socket, DWORD ioctl) {
++  SOCKET bsp_socket;
++  DWORD bytes;
++
++  if (WSAIoctl(socket,
++               ioctl,
++               NULL,
++               0,
++               &bsp_socket,
++               sizeof bsp_socket,
++               &bytes,
++               NULL,
++               NULL) != SOCKET_ERROR)
++    return bsp_socket;
++  else
++    return INVALID_SOCKET;
++}
++
++SOCKET ws_get_base_socket(SOCKET socket) {
++  SOCKET base_socket;
++  DWORD error;
++
++  for (;;) {
++    base_socket = ws__ioctl_get_bsp_socket(socket, SIO_BASE_HANDLE);
++    if (base_socket != INVALID_SOCKET)
++      return base_socket;
++
++    error = GetLastError();
++    if (error == WSAENOTSOCK)
++      return_set_error(INVALID_SOCKET, error);
++
++    /* Even though Microsoft documentation clearly states that LSPs should
++     * never intercept the `SIO_BASE_HANDLE` ioctl [1], Komodia based LSPs do
++     * so anyway, breaking it, with the apparent intention of preventing LSP
++     * bypass [2]. Fortunately they don't handle `SIO_BSP_HANDLE_POLL`, which
++     * will at least let us obtain the socket associated with the next winsock
++     * protocol chain entry. If this succeeds, loop around and call
++     * `SIO_BASE_HANDLE` again with the returned BSP socket, to make sure that
++     * we unwrap all layers and retrieve the actual base socket.
++     *  [1] https://docs.microsoft.com/en-us/windows/win32/winsock/winsock-ioctls
++     *  [2] https://www.komodia.com/newwiki/index.php?title=Komodia%27s_Redirector_bug_fixes#Version_2.2.2.6
++     */
++    base_socket = ws__ioctl_get_bsp_socket(socket, SIO_BSP_HANDLE_POLL);
++    if (base_socket != INVALID_SOCKET && base_socket != socket)
++      socket = base_socket;
++    else
++      return_set_error(INVALID_SOCKET, error);
++  }
++}
+diff --git a/compat/windows/wepoll.h b/compat/windows/wepoll.h
+new file mode 100644
+index 0000000..daf6bdb
+--- /dev/null
++++ b/compat/windows/wepoll.h
+@@ -0,0 +1,113 @@
++/*
++ * wepoll - epoll for Windows
++ * https://github.com/piscisaureus/wepoll
++ *
++ * Copyright 2012-2020, Bert Belder <bertbelder@gmail.com>
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met:
++ *
++ *   * Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *
++ *   * Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in the
++ *     documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef WEPOLL_H_
++#define WEPOLL_H_
++
++#ifndef WEPOLL_EXPORT
++#define WEPOLL_EXPORT
++#endif
++
++#include <stdint.h>
++
++enum EPOLL_EVENTS {
++  EPOLLIN      = (int) (1U <<  0),
++  EPOLLPRI     = (int) (1U <<  1),
++  EPOLLOUT     = (int) (1U <<  2),
++  EPOLLERR     = (int) (1U <<  3),
++  EPOLLHUP     = (int) (1U <<  4),
++  EPOLLRDNORM  = (int) (1U <<  6),
++  EPOLLRDBAND  = (int) (1U <<  7),
++  EPOLLWRNORM  = (int) (1U <<  8),
++  EPOLLWRBAND  = (int) (1U <<  9),
++  EPOLLMSG     = (int) (1U << 10), /* Never reported. */
++  EPOLLRDHUP   = (int) (1U << 13),
++  EPOLLONESHOT = (int) (1U << 31)
++};
++
++#define EPOLLIN      (1U <<  0)
++#define EPOLLPRI     (1U <<  1)
++#define EPOLLOUT     (1U <<  2)
++#define EPOLLERR     (1U <<  3)
++#define EPOLLHUP     (1U <<  4)
++#define EPOLLRDNORM  (1U <<  6)
++#define EPOLLRDBAND  (1U <<  7)
++#define EPOLLWRNORM  (1U <<  8)
++#define EPOLLWRBAND  (1U <<  9)
++#define EPOLLMSG     (1U << 10)
++#define EPOLLRDHUP   (1U << 13)
++#define EPOLLONESHOT (1U << 31)
++
++#define EPOLL_CTL_ADD 1
++#define EPOLL_CTL_MOD 2
++#define EPOLL_CTL_DEL 3
++
++typedef void* HANDLE;
++typedef uintptr_t SOCKET;
++
++typedef union epoll_data {
++  void* ptr;
++  int fd;
++  uint32_t u32;
++  uint64_t u64;
++  SOCKET sock; /* Windows specific */
++  HANDLE hnd;  /* Windows specific */
++} epoll_data_t;
++
++struct epoll_event {
++  uint32_t events;   /* Epoll events and flags */
++  epoll_data_t data; /* User data variable */
++};
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++WEPOLL_EXPORT HANDLE epoll_create(int size);
++WEPOLL_EXPORT HANDLE epoll_create1(int flags);
++
++WEPOLL_EXPORT int epoll_close(HANDLE ephnd);
++
++WEPOLL_EXPORT int epoll_ctl(HANDLE ephnd,
++                            int op,
++                            SOCKET sock,
++                            struct epoll_event* event);
++
++WEPOLL_EXPORT int epoll_wait(HANDLE ephnd,
++                             struct epoll_event* events,
++                             int maxevents,
++                             int timeout);
++
++#ifdef __cplusplus
++} /* extern "C" */
++#endif
++
++#endif /* WEPOLL_H_ */
+diff --git a/compat/windows/wepoll.o b/compat/windows/wepoll.o
+new file mode 100644
+index 0000000000000000000000000000000000000000..a2028fdb19968cde75a99bd215a8a3e3db16e65a
+GIT binary patch
+literal 115343
+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
+ZpPKfaloKk71}8dyYF!>bw*$Qv{}*hJP$mEX
+
+literal 0
+HcmV?d00001
+
+diff --git a/compat/windows/win_sockops.h b/compat/windows/win_sockops.h
+new file mode 100644
+index 0000000..01d658f
+--- /dev/null
++++ b/compat/windows/win_sockops.h
+@@ -0,0 +1,30 @@
++/*
++ * compat/windows/win_sockops.h — per-file POSIX-socket-op remapping for native Windows.
++ * Include ONLY in socket-pure TUs (anet.c, net_io.c, api.c) AFTER system includes.
++ * Non-socket exceptions (net_io.c uuidFile read, epoll-fd close) are patched in source
++ * with explicit _open/_read/_close / rsb_epoll_close so these macros don't apply there.
++ */
++#ifndef WIN_SOCKOPS_H
++#define WIN_SOCKOPS_H
++
++#include "net_compat.h"
++
++/* fcntl(fd, F_GETFL) / fcntl(fd, F_SETFL, flags|O_NONBLOCK) → ioctlsocket(FIONBIO) */
++#ifndef F_GETFL
++#define F_GETFL 3
++#endif
++#ifndef F_SETFL
++#define F_SETFL 4
++#endif
++/* variadic so both fcntl(fd,F_GETFL) and fcntl(fd,F_SETFL,flags) compile */
++static inline int win_fcntl(int fd, int cmd, ...) {
++    if (cmd == F_SETFL) return win_set_nonblock(fd);
++    return 0; /* F_GETFL: return 0; readsb ORs O_NONBLOCK then does F_SETFL */
++}
++
++#define close(fd)          win_closesocket(fd)
++#define read(fd, b, n)     win_recv((fd), (b), (n))
++#define write(fd, b, n)    win_send((fd), (b), (n))
++#define fcntl              win_fcntl
++
++#endif /* WIN_SOCKOPS_H */
+diff --git a/net_io.h b/net_io.h
+index 23b2570..9700a6a 100644
+--- a/net_io.h
++++ b/net_io.h
+@@ -24,7 +24,11 @@
+ #ifndef NETIO_H
+ #define NETIO_H
+ 
++#if defined(_WIN32) || defined(__MINGW32__) || defined(__MINGW64__)
++#include "compat/windows/net_compat.h"
++#else
+ #include <sys/socket.h>
++#endif
+ 
+ // Describes a networking service (group of connections)
+ 
+diff --git a/readsb.c b/readsb.c
+index 7c975f1..8d06c93 100644
+--- a/readsb.c
++++ b/readsb.c
+@@ -441,7 +441,7 @@ void priorityTasksRun() {
+         struct tm local;
+         gmtime_r(&nowTime, &local);
+         char timebuf[512];
+-        strftime(timebuf, 128, "%T", &local);
++        strftime(timebuf, 128, "%H:%M:%S", &local); // %T unsupported by mingw msvcrt strftime
+         fprintf(stderr, "priorityTasksRun: utcTime: %s.%03lld epoch: %.3f\n", timebuf, (long long) now % 1000, now / 1000.0);
+     }
+     pthread_mutex_lock(&Modes.hungTimerMutex);
+diff --git a/readsb.h b/readsb.h
+index 96dd94a..d259cdb 100644
+--- a/readsb.h
++++ b/readsb.h
+@@ -87,7 +87,6 @@
+ #include <fcntl.h>
+ #include <ctype.h>
+ #include <sys/stat.h>
+-#include <sys/ioctl.h>
+ #include <time.h>
+ #include <limits.h>
+ #include <sys/types.h>
+@@ -98,12 +97,19 @@
+ #include "threadpool.h"
+ #include <stdatomic.h>
+ #include <zstd.h>
+-#include <sys/mman.h>
+ 
++#if defined(_WIN32) || defined(__MINGW32__) || defined(__MINGW64__)
++// native Windows (mingw): no sys/ioctl.h, sys/mman.h, sys/epoll.h, sys/eventfd.h.
++// epoll comes from compat/windows/epoll_shim.h (via compat/compat.h below); eventfd is
++// skipped (NO_EVENT_FD). winsock is pulled in by compat/compat.h -> net_compat.h.
++#else
++#include <sys/ioctl.h>
++#include <sys/mman.h>
+ #ifndef __APPLE__
+ #include <sys/epoll.h>
+ #include <sys/eventfd.h>
+ #endif
++#endif
+ 
+ 
+ #include "compat/compat.h"
+diff --git a/threadpool.c b/threadpool.c
+index 43fa952..76ef994 100644
+--- a/threadpool.c
++++ b/threadpool.c
+@@ -35,6 +35,11 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
+ #include <stdio.h>
+ #endif
+ 
++#if defined(_WIN32) || defined(__MINGW32__) || defined(__MINGW64__)
++#define srandom srand   // BSD PRNG → Windows CRT (this TU doesn't include compat.h)
++#define random rand
++#endif
++
+ typedef struct {
+     int index;
+     threadpool_t* pool;
+diff --git a/util.c b/util.c
+index b8a9963..ad64429 100644
+--- a/util.c
++++ b/util.c
+@@ -305,8 +305,8 @@ void threadSignalJoin(threadT *thread) {
+     if (thread->joined)
+         return;
+     int err = 0;
+-    #ifdef __APPLE__
+-    pthread_join(thread->pthread, NULL);
++    #if defined(__APPLE__) || defined(_WIN32) || defined(__MINGW32__) || defined(__MINGW64__)
++    pthread_join(thread->pthread, NULL); // no pthread_tryjoin_np on macOS/Windows; thread exits on the global flag
+     #else
+     int64_t timeout = Modes.joinTimeout;
+     while ((err = pthread_tryjoin_np(thread->pthread, NULL)) && timeout-- > 0) {
