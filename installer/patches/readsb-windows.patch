@@ -348,10 +348,10 @@ index 0000000..4913b30
 +#endif /* WIN_MMAN_COMPAT_H */
 diff --git a/compat/windows/net_compat.h b/compat/windows/net_compat.h
 new file mode 100644
-index 0000000..d0bf405
+index 0000000..928ec48
 --- /dev/null
 +++ b/compat/windows/net_compat.h
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,136 @@
 +/*
 + * compat/windows/net_compat.h — global-safe winsock types/init/constants for readsb.
 + * Included everywhere (via compat/compat.h). Provides Windows socket headers, one-time
@@ -458,6 +458,20 @@ index 0000000..d0bf405
 +}
 +#define setsockopt(s, l, o, v, n) win_setsockopt((s), (l), (o), (v), (n))
 +#define getsockopt(s, l, o, v, n) win_getsockopt((s), (l), (o), (v), (n))
++
++/* connect() wrapper: winsock never sets errno, AND a non-blocking connect returns
++ * WSAEWOULDBLOCK where POSIX returns EINPROGRESS. readsb's outbound connector
++ * (anetTcpNonBlockConnect) tests `errno == EINPROGRESS`, so without this the feed
++ * connect to feed.adsbiq.com fails with a stale "Invalid argument". */
++static inline int win_connect(int s, const struct sockaddr *addr, socklen_t len) {
++	int r = connect((SOCKET) (uintptr_t) s, addr, (int) len);
++	if (r) {
++		int e = WSAGetLastError();
++		errno = (e == WSAEWOULDBLOCK) ? EINPROGRESS : wsa_to_errno(e);
++	}
++	return r;
++}
++#define connect(s, a, l) win_connect((s), (a), (l))
 +
 +/* accept4 is a Linux extension: accept + optional SOCK_NONBLOCK. */
 +static inline int win_accept4(int fd, struct sockaddr *a, socklen_t *l, int flags) {
