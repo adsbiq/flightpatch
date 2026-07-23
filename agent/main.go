@@ -160,6 +160,9 @@ func main() {
 
 	// Register once (or whenever the token is missing).
 	if cfg.Token == "" {
+		if err := cfg.EnsureDeviceIdentity(); err != nil {
+			log.Fatalf("cannot establish durable device identity: %v", err)
+		}
 		log.Printf("registering device with %s ...", cfg.Server)
 		r, err := Register(cfg.Server, registerReq{
 			DeviceID: cfg.DeviceID, OrgName: cfg.OrgName, UserEmail: cfg.UserEmail,

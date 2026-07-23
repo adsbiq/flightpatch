@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,7 +13,7 @@ import (
 // DeviceConfig is the agent's persisted identity + settings. It survives restarts
 // so a device registers exactly once and keeps its server-issued token.
 type DeviceConfig struct {
-	DeviceID   string `json:"device_id"`            // server-issued, stable
+	DeviceID   string `json:"device_id"`            // locally generated, server-confirmed, stable
 	Token      string `json:"token"`               // per-device auth (X-Device-Token)
 	OrgName    string `json:"org_name,omitempty"`  // optional school/FBO name (first-run)
 	UserEmail  string `json:"user_email,omitempty"`// optional owner email
@@ -28,6 +31,25 @@ type DeviceConfig struct {
 	Roles      []DongleRole `json:"roles,omitempty"`       // persisted per-serial role assignments
 
 	path string `json:"-"`
+}
+
+// EnsureDeviceIdentity creates and persists an installation identity before
+// the first network request. A timeout after server registration can therefore
+// be retried idempotently instead of creating another server-side device row.
+func (c *DeviceConfig) EnsureDeviceIdentity() error {
+	if c.DeviceID != "" {
+		return nil
+	}
+	raw := make([]byte, 12)
+	if _, err := rand.Read(raw); err != nil {
+		return fmt.Errorf("generate device identity: %w", err)
+	}
+	c.DeviceID = "dev-" + hex.EncodeToString(raw)
+	if err := c.Save(); err != nil {
+		c.DeviceID = ""
+		return fmt.Errorf("persist device identity: %w", err)
+	}
+	return nil
 }
 
 // DongleRole pins a dongle (by USB serial) to a decoder role so the agent does
