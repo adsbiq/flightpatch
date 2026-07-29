@@ -64,7 +64,10 @@ type countWriter struct {
 func (c countWriter) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
 	if c.st != nil && n > 0 {
-		atomic.AddInt64(&c.st.bytesFed, int64(n))
+		before := atomic.AddInt64(&c.st.bytesFed, int64(n)) - int64(n)
+		if before == 0 {
+			c.st.notify()
+		}
 	}
 	return n, err
 }
@@ -90,14 +93,14 @@ func runForward(ctx context.Context, cfg Config, st *Stats) error {
 			return err
 		}
 		if st != nil {
-			atomic.StoreInt32(&st.connected, 1)
+			st.setConnected(true)
 		}
 		// Tear both conns down if the context is cancelled while io.Copy is blocked.
 		stop := context.AfterFunc(ctx, func() { src.Close(); dst.Close() })
 		n, cerr := io.Copy(countWriter{dst, st}, src)
 		stop()
 		if st != nil {
-			atomic.StoreInt32(&st.connected, 0)
+			st.setConnected(false)
 		}
 		src.Close()
 		dst.Close()

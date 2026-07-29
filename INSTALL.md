@@ -20,7 +20,8 @@ no configuration.
    dongle that's connected during setup.
 3. Run the installer. Optionally **name your airfield** (flight school / FBO) so
    your feeder shows up under it. Click through.
-4. You're live — it opens **flightpatch.app/airport**, and your aircraft appear
+4. You're live — it opens **flightpatch.app/setup** to connect the feeder to
+   your organization and airport, then your aircraft appear
    within a minute.
 
 Flightpatch installs the USB driver, auto-tunes the radio by listening on your

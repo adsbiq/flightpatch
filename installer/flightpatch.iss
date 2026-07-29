@@ -10,9 +10,9 @@
 ; assemble them from the CI artifacts. Compile with: iscc flightpatch.iss
 
 #define AppName "Flightpatch"
-#define AppVer "0.4.1"
+#define AppVer "0.4.2"
 #define AppPublisher "ADSBiq"
-#define AppURL "https://flightpatch.app/airport"
+#define AppURL "https://flightpatch.app/setup"
 ; RTL2832U (all RTL-SDR dongles): USB VID 0x0BDA, PID 0x2838
 #define RtlVid "0x0BDA"
 #define RtlPid "0x2838"
@@ -41,10 +41,10 @@ UninstallDisplayName={#AppName}
 
 [Messages]
 ; Onboarding copy — plain language, no jargon. (See PRODUCT_UX.md for the full spec.)
-WelcomeLabel2=In about a minute, your airfield goes live at flightpatch.app/airport — every takeoff, landing, and pattern, in real time.%n%nWe'll set up your dongle and start feeding automatically. No Raspberry Pi, no config, no hassle.
-FinishedHeadingLabel=You're live! 🎉
-FinishedLabelNoIcons=Your airfield is now feeding the ADSBiq network. Aircraft may take a minute to appear on the map.
-FinishedLabel=Your airfield is now feeding the ADSBiq network. Aircraft may take a minute to appear on the map.
+WelcomeLabel2=In about a minute, your airfield goes live at flightpatch.app. We'll set up your dongle and feeder automatically, then open one short step to connect your school and airport.%n%nNo Raspberry Pi, no config, no hassle.
+FinishedHeadingLabel=Setup complete
+FinishedLabelNoIcons=Flightpatch setup has finished.
+FinishedLabel=Flightpatch setup has finished.
 
 [Files]
 ; the agent
@@ -68,9 +68,9 @@ Filename: "{app}\driver\wdi-simple.exe"; \
   Flags: runhidden waituntilterminated skipifdoesntexist
 ; 2) install + start the background service (config written in CurStepChanged)
 Filename: "{app}\service\adsbiq-service.exe"; Parameters: "install"; Flags: runhidden waituntilterminated
-Filename: "{app}\service\adsbiq-service.exe"; Parameters: "start"; Flags: runhidden waituntilterminated
+Filename: "{app}\service\adsbiq-service.exe"; Parameters: "start"; Flags: runhidden waituntilterminated; AfterInstall: VerifyFeeding
 ; 3) offer to open the live map
-Filename: "{#AppURL}"; Description: "Open my live airfield map"; Flags: postinstall shellexec nowait
+Filename: "{#AppURL}"; Description: "Finish setup and open my airfield"; Flags: postinstall shellexec nowait
 
 [UninstallRun]
 Filename: "{app}\service\adsbiq-service.exe"; Parameters: "stop"; Flags: runhidden waituntilterminated; RunOnceId: "StopSvc"
@@ -79,6 +79,22 @@ Filename: "{app}\service\adsbiq-service.exe"; Parameters: "uninstall"; Flags: ru
 [Code]
 var
   OrgPage: TInputQueryWizardPage;
+  FeedingVerified: Boolean;
+  FeedingError: string;
+
+procedure VerifyFeeding;
+var
+  ResultCode: Integer;
+begin
+  WizardForm.StatusLabel.Caption := 'Waiting for server-confirmed aircraft data...';
+  FeedingVerified :=
+    Exec(ExpandConstant('{app}\adsbiq-feed-agent.exe'),
+         '--wait-ready 120s', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+    and (ResultCode = 0);
+  if not FeedingVerified then
+    FeedingError := 'Flightpatch was installed, but ADSBiq did not confirm delivered data. ' +
+      'Check that the dongle and antenna are connected, then choose Retry from the setup page.';
+end;
 
 procedure InitializeWizard;
 begin
@@ -143,4 +159,18 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
     WriteServiceConfig;  // runs before the [Run] service-install entries
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if CurPageID = wpFinished then begin
+    if FeedingVerified then begin
+      WizardForm.FinishedHeadingLabel.Caption := 'You''re live!';
+      WizardForm.FinishedLabel.Caption :=
+        'ADSBiq confirmed that this computer is delivering aircraft data.';
+    end else begin
+      WizardForm.FinishedHeadingLabel.Caption := 'Installed, but not feeding yet';
+      WizardForm.FinishedLabel.Caption := FeedingError;
+    end;
+  end;
 end;

@@ -11,6 +11,31 @@ type Stats struct {
 	bytesFed  int64 // atomic: total bytes forwarded to adsbiq this run
 	connected int32 // atomic bool: is the feed link currently up
 	start     time.Time
+	changed   chan struct{}
+}
+
+func newStats() *Stats {
+	return &Stats{start: time.Now(), changed: make(chan struct{}, 1)}
+}
+
+func (s *Stats) notify() {
+	if s == nil || s.changed == nil {
+		return
+	}
+	select {
+	case s.changed <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Stats) setConnected(v bool) {
+	var next int32
+	if v {
+		next = 1
+	}
+	if atomic.SwapInt32(&s.connected, next) != next {
+		s.notify()
+	}
 }
 
 // snapshot returns a consistent-enough read of the counters plus a byte-rate

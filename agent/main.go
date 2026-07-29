@@ -25,7 +25,7 @@ import (
 )
 
 // Version is stamped into telemetry and drives auto-update comparisons.
-const Version = "0.4.1"
+const Version = "0.4.2"
 
 func platformString() string { return runtime.GOOS + "/" + runtime.GOARCH }
 
@@ -46,6 +46,7 @@ func main() {
 		dedupe     = flag.Bool("dedupe", false, "diagnostic: enumerate, de-duplicate colliding serials, print, and exit")
 		resetUSB   = flag.Bool("reset-usb", false, "diagnostic: cycle RTL-SDR USB devices (needs elevation) so EEPROM serial writes take effect, then exit")
 		jobTest    = flag.Bool("job-test", false, "diagnostic: spawn a child in the kill-on-close job then exit; the child must die with us (no orphans)")
+		waitReady  = flag.Duration("wait-ready", 0, "wait for server-confirmed delivered feed data, then exit")
 	)
 	flag.Parse()
 
@@ -64,6 +65,20 @@ func main() {
 	}
 	if *email != "" {
 		cfg.UserEmail = *email
+	}
+	if *waitReady > 0 {
+		deadline := time.Now().Add(*waitReady)
+		for time.Now().Before(deadline) {
+			if cfg.DeviceID != "" && cfg.Token != "" {
+				if s, err := DeviceStatus(cfg.Server, cfg.Token, cfg.DeviceID); err == nil && s.Feeding {
+					log.Printf("server confirmed feeding (%d bytes)", s.BytesFed)
+					return
+				}
+			}
+			time.Sleep(250 * time.Millisecond)
+			cfg = LoadConfig(*cfgPath)
+		}
+		log.Fatalf("server did not confirm feeding within %s", *waitReady)
 	}
 
 	if *eepromDump {
@@ -158,19 +173,23 @@ func main() {
 		return
 	}
 
-	// Register once (or whenever the token is missing).
-	if cfg.Token == "" {
-		if err := cfg.EnsureDeviceIdentity(); err != nil {
-			log.Fatalf("cannot establish durable device identity: %v", err)
-		}
-		log.Printf("registering device with %s ...", cfg.Server)
-		r, err := Register(cfg.Server, registerReq{
-			DeviceID: cfg.DeviceID, OrgName: cfg.OrgName, UserEmail: cfg.UserEmail,
-			Platform: platformString(), Version: Version,
-		})
-		if err != nil {
+	// Register idempotently on every service start. Besides making the device
+	// visible immediately, this deliberately applies a new --org value supplied
+	// by a reinstall instead of silently retaining the old display name.
+	if err := cfg.EnsureDeviceIdentity(); err != nil {
+		log.Fatalf("cannot establish durable device identity: %v", err)
+	}
+	log.Printf("registering device with %s ...", cfg.Server)
+	r, err := Register(cfg.Server, registerReq{
+		DeviceID: cfg.DeviceID, OrgName: cfg.OrgName, UserEmail: cfg.UserEmail,
+		Platform: platformString(), Version: Version,
+	})
+	if err != nil {
+		if cfg.Token == "" {
 			log.Fatalf("registration failed: %v", err)
 		}
+		log.Printf("registration refresh failed (using durable identity): %v", err)
+	} else {
 		cfg.DeviceID, cfg.Token = r.DeviceID, r.Token
 		if r.FeedAddr != "" {
 			cfg.Feed = r.FeedAddr
@@ -188,7 +207,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	stats := &Stats{start: time.Now()}
+	stats := newStats()
 	mgr := newDecoderManager(cfg, stats)
 	mgr.setEnabled(true) // feed by default until the server says otherwise
 	go mgr.run(ctx)
@@ -198,8 +217,8 @@ func main() {
 	log.Printf("stopped")
 }
 
-// phoneHome sends telemetry every 60s, applies the returned desired state, and
-// executes any queued commands, acking them on the next beat.
+// phoneHome reports at startup and on meaningful state edges. The periodic beat
+// is only a liveness fallback; status visibility must never wait for it.
 func phoneHome(ctx context.Context, cfg *DeviceConfig, stats *Stats, mgr *DecoderManager, stop context.CancelFunc) {
 	var acked []int64
 	var prevBytes int64
@@ -231,12 +250,21 @@ func phoneHome(ctx context.Context, cfg *DeviceConfig, stats *Stats, mgr *Decode
 	}
 
 	beat() // report immediately on startup
-	t := time.NewTicker(60 * time.Second)
+	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-stats.changed:
+			timer := time.NewTimer(75 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			beat()
 		case <-t.C:
 			beat()
 		}

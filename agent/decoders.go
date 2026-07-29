@@ -123,8 +123,12 @@ func (m *DecoderManager) isEnabled() bool {
 
 func (m *DecoderManager) setActive(a []string) {
 	m.mu.Lock()
+	changed := strings.Join(m.active, "\x00") != strings.Join(a, "\x00")
 	m.active = a
 	m.mu.Unlock()
+	if changed {
+		m.stats.notify()
+	}
 }
 
 // status returns the roles currently being fed (for telemetry).

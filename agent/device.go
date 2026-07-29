@@ -15,6 +15,7 @@ import (
 const (
 	pathRegister  = "/api/v2/feeder/device/register"
 	pathTelemetry = "/api/v2/feeder/device/telemetry"
+	pathStatus    = "/api/v2/feeder/device/"
 )
 
 var httpClient = &http.Client{Timeout: 20 * time.Second}
@@ -72,6 +73,36 @@ type telemetryResp struct {
 	Config        map[string]any `json:"config"`
 	Commands      []Command      `json:"commands"`
 	LatestRelease string         `json:"latest_release"`
+}
+
+type deviceStatus struct {
+	State    string `json:"state"`
+	Feeding  bool   `json:"feeding"`
+	BytesFed int64  `json:"bytes_fed"`
+}
+
+func DeviceStatus(server, token, deviceID string) (*deviceStatus, error) {
+	var out deviceStatus
+	req, err := http.NewRequest(http.MethodGet, server+pathStatus+deviceID+"/status", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Device-Token", token)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "adsbiq-feed-agent/"+Version)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("status -> %d: %s", resp.StatusCode, bytes.TrimSpace(data))
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // Telemetry sends a heartbeat and returns the server's desired state + any
