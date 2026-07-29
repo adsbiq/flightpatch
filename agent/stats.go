@@ -8,8 +8,9 @@ import (
 // Stats is the live counters the phone-home loop reports to the server.
 // Fields are touched atomically by the forwarder and read by telemetry.
 type Stats struct {
-	bytesFed  int64 // atomic: total bytes forwarded to adsbiq this run
-	connected int32 // atomic bool: is the feed link currently up
+	bytesFed  int64  // atomic: total bytes forwarded to adsbiq this run
+	connected int32  // atomic bool: is the feed link currently up
+	links     uint32 // bitmask of live protocol links (ADS-B TCP / VDL2 UDP)
 	start     time.Time
 	changed   chan struct{}
 }
@@ -29,11 +30,41 @@ func (s *Stats) notify() {
 }
 
 func (s *Stats) setConnected(v bool) {
-	var next int32
-	if v {
-		next = 1
+	s.setLink(1, v)
+}
+
+func (s *Stats) setLink(bit uint32, v bool) {
+	for {
+		old := atomic.LoadUint32(&s.links)
+		next := old &^ bit
+		if v {
+			next = old | bit
+		}
+		if old == next {
+			return
+		}
+		if atomic.CompareAndSwapUint32(&s.links, old, next) {
+			wasConnected := old != 0
+			isConnected := next != 0
+			var flag int32
+			if isConnected {
+				flag = 1
+			}
+			atomic.StoreInt32(&s.connected, flag)
+			if wasConnected != isConnected {
+				s.notify()
+			}
+			return
+		}
 	}
-	if atomic.SwapInt32(&s.connected, next) != next {
+}
+
+func (s *Stats) addBytes(n int) {
+	if s == nil || n <= 0 {
+		return
+	}
+	before := atomic.AddInt64(&s.bytesFed, int64(n)) - int64(n)
+	if before == 0 {
 		s.notify()
 	}
 }

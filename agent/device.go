@@ -83,7 +83,9 @@ type deviceStatus struct {
 
 func DeviceStatus(server, token, deviceID string) (*deviceStatus, error) {
 	var out deviceStatus
-	req, err := http.NewRequest(http.MethodGet, server+pathStatus+deviceID+"/status", nil)
+	// POST keeps this authenticated control-plane poll out of consumer GET
+	// rate limits while the installer is waiting for its one-time verdict.
+	req, err := http.NewRequest(http.MethodPost, server+pathStatus+deviceID+"/status", nil)
 	if err != nil {
 		return nil, err
 	}

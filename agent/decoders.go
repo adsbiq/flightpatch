@@ -3,7 +3,7 @@
 // crash, hot-plugging new dongles, and freeing them when feeding is paused.
 //
 //	1090 dongle -> dump1090 (Beast :30005) -> forwarder -> feed.adsbiq.com:30004
-//	136  dongle -> dumpvdl2 (JSON/UDP)     ----------->    feed.adsbiq.com:5552
+//	136  dongle -> dumpvdl2 -> local UDP relay -----------> feed.adsbiq.com:5552
 //
 // Decoders are child processes started windowless + at Idle priority so a feeder
 // never disturbs the machine it shares.
@@ -150,6 +150,7 @@ func (m *DecoderManager) run(parent context.Context) {
 	}
 	active := map[string]child{} // keyed by dongle key() (USB port -> unique)
 	var fwdCancel context.CancelFunc
+	var vdlCancel context.CancelFunc
 
 	stopAll := func() {
 		for s, c := range active {
@@ -159,6 +160,10 @@ func (m *DecoderManager) run(parent context.Context) {
 		if fwdCancel != nil {
 			fwdCancel()
 			fwdCancel = nil
+		}
+		if vdlCancel != nil {
+			vdlCancel()
+			vdlCancel = nil
 		}
 		m.setActive(nil)
 	}
@@ -181,10 +186,13 @@ func (m *DecoderManager) run(parent context.Context) {
 		assigns := m.assignRoles(parent, dongles)
 		seen := map[string]bool{}
 		wantForward := false
+		wantVDL2 := false
 		for _, a := range assigns {
 			seen[a.Dongle.key()] = true
 			if a.Role == RoleADSB {
 				wantForward = true
+			} else if a.Role == RoleVDL2 {
+				wantVDL2 = true
 			}
 			if a.Role == RoleOff {
 				continue
@@ -217,6 +225,25 @@ func (m *DecoderManager) run(parent context.Context) {
 		} else if !wantForward && fwdCancel != nil {
 			fwdCancel()
 			fwdCancel = nil
+		}
+		if wantVDL2 && vdlCancel == nil {
+			vctx, vcancel := context.WithCancel(parent)
+			vdlCancel = vcancel
+			go func() {
+				for vctx.Err() == nil {
+					if err := runVDL2Forward(vctx, m.cfg.LocalVDL2, m.cfg.VDL2Feed, m.stats); err != nil && vctx.Err() == nil {
+						log.Printf("VDL2 relay failed: %v (retry 2s)", err)
+						if !sleepCtx(vctx, 2*time.Second) {
+							return
+						}
+					}
+				}
+			}()
+			log.Printf("VDL2 forwarder started (%s -> %s)", m.cfg.LocalVDL2, m.cfg.VDL2Feed)
+		} else if !wantVDL2 && vdlCancel != nil {
+			vdlCancel()
+			vdlCancel = nil
+			m.stats.setLink(vdl2LinkBit, false)
 		}
 		// publish status
 		st := make([]string, 0, len(active))
@@ -256,6 +283,10 @@ func (m *DecoderManager) assignRoles(ctx context.Context, dongles []Dongle) []ro
 		switch {
 		case role != "":
 			// keep configured role
+		case m.cfg.DefaultRole == RoleADSB && adsbAvail:
+			role = RoleADSB
+		case m.cfg.DefaultRole == RoleVDL2 && vdl2Avail:
+			role = RoleVDL2
 		case adsbAvail && !vdl2Avail:
 			role = RoleADSB
 		case vdl2Avail && !adsbAvail:
@@ -479,7 +510,7 @@ func (m *DecoderManager) buildDecoderCmd(ctx context.Context, role string, d Don
 		if !ok {
 			return nil, fmt.Errorf("%s not found in %s", vdl2ExeName(), m.cfg.DecoderDir)
 		}
-		host, port := splitHostPort(m.cfg.VDL2Feed)
+		host, port := splitHostPort(m.cfg.LocalVDL2)
 		args := []string{"--rtlsdr", strconv.Itoa(d.Index), "--gain", m.cfg.Gain,
 			"--output", fmt.Sprintf("decoded:json:udp:address=%s,port=%s", host, port)}
 		args = append(args, m.cfg.VDL2Freqs...)

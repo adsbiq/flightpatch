@@ -10,7 +10,7 @@
 ; assemble them from the CI artifacts. Compile with: iscc flightpatch.iss
 
 #define AppName "Flightpatch"
-#define AppVer "0.4.5"
+#define AppVer "0.4.6"
 #define AppPublisher "ADSBiq"
 #define AppURL "https://flightpatch.app/setup"
 ; RTL2832U (all RTL-SDR dongles): USB VID 0x0BDA, PID 0x2838
@@ -65,7 +65,7 @@ Name: "{group}\Uninstall ADSBiq Feeder"; Filename: "{uninstallexe}"
 Filename: "{app}\driver\wdi-simple.exe"; \
   Parameters: "--vid {#RtlVid} --pid {#RtlPid} --type 0 --silent --name ""RTL2832U"""; \
   StatusMsg: "Installing USB driver for your dongle..."; \
-  Flags: runhidden waituntilterminated skipifdoesntexist
+  Flags: runhidden waituntilterminated skipifdoesntexist; Check: DriverInstallNeeded
 ; 2) write config, then install + start the background service
 Filename: "{app}\service\adsbiq-service.exe"; Parameters: "install"; Flags: runhidden waituntilterminated; BeforeInstall: WriteServiceConfig
 Filename: "{app}\service\adsbiq-service.exe"; Parameters: "start"; Flags: runhidden waituntilterminated; AfterInstall: VerifyFeeding
@@ -79,8 +79,10 @@ Filename: "{app}\service\adsbiq-service.exe"; Parameters: "uninstall"; Flags: ru
 [Code]
 var
   OrgPage: TInputQueryWizardPage;
+  RolePage: TInputOptionWizardPage;
   FeedingVerified: Boolean;
   FeedingError: string;
+  IsUpgrade: Boolean;
 
 procedure VerifyFeeding;
 var
@@ -91,9 +93,16 @@ begin
     Exec(ExpandConstant('{app}\adsbiq-feed-agent.exe'),
          '--wait-ready 120s', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
     and (ResultCode = 0);
-  if not FeedingVerified then
-    FeedingError := 'Flightpatch was installed, but ADSBiq did not confirm delivered data. ' +
-      'Check that the dongle and antenna are connected, then choose Retry from the setup page.';
+  if not FeedingVerified then begin
+    case ResultCode of
+      2: FeedingError := 'Flightpatch could not register with ADSBiq. Check this computer''s internet connection, then run Setup again.';
+      3: FeedingError := 'Flightpatch could not detect a working receiver. Reconnect the USB dongle, try another USB port, then run Setup again.';
+      4: FeedingError := 'The receiver started, but its feed connection did not. Check firewall or security software, then run Setup again.';
+      5: FeedingError := 'Flightpatch connected to ADSBiq, but the receiver delivered no radio data. Check the antenna and its cable, then try again.';
+    else
+      FeedingError := 'Flightpatch was installed, but ADSBiq did not confirm delivered data. Reconnect the receiver and run Setup again.';
+    end;
+  end;
 end;
 
 procedure InitializeWizard;
@@ -113,6 +122,16 @@ begin
     'If you enter a name, your feeder shows up on the ADSBiq network under it. ' +
     'Leave it blank to feed anonymously. You can change this later.');
   OrgPage.Add('School / FBO / organization name:', False);
+
+  RolePage := CreateInputOptionPage(OrgPage.ID,
+    'Choose what this receiver listens for',
+    'Most Flightpatch installations use ADS-B.',
+    'Choose the signal for the connected receiver. This avoids a long radio scan and starts feeding immediately.',
+    True, False);
+  RolePage.Add('ADS-B 1090 MHz (recommended)');
+  RolePage.Add('VDL2 136 MHz');
+  RolePage.Add('Auto-detect (can take up to two minutes)');
+  RolePage.SelectedValueIndex := 0;
 end;
 
 // XML-escape the few characters that matter for the WinSW config.
@@ -132,7 +151,16 @@ var
   Xml, Args, Org, Path: string;
 begin
   Org := Trim(OrgPage.Values[0]);
+  // Embedded quotes would break the Windows command line. Preserve the name
+  // visibly by converting them to apostrophes before XML/argument escaping.
+  StringChangeEx(Org, '"', '''', True);
   Args := '--decoders "' + ExpandConstant('{app}\decoders') + '"';
+  case RolePage.SelectedValueIndex of
+    1: Args := Args + ' --default-role vdl2';
+    2: Args := Args + ' --default-role auto';
+  else
+    Args := Args + ' --default-role adsb';
+  end;
   if Org <> '' then
     Args := Args + ' --org "' + Org + '"';
 
@@ -165,9 +193,32 @@ var
 begin
   Result := '';
   ServiceExe := ExpandConstant('{app}\service\adsbiq-service.exe');
-  if FileExists(ServiceExe) then begin
+  IsUpgrade := FileExists(ServiceExe);
+  if IsUpgrade then begin
     WizardForm.StatusLabel.Caption := 'Stopping the existing Flightpatch service...';
     Exec(ServiceExe, 'stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+end;
+
+function DriverInstallNeeded: Boolean;
+begin
+  // Rebinding WinUSB on every ordinary upgrade needlessly resets healthy
+  // hardware and was a major source of multi-minute startup delay.
+  Result := not IsUpgrade;
+end;
+
+procedure DeinitializeSetup;
+var
+  ResultCode: Integer;
+  ServiceExe: string;
+begin
+  // If setup is cancelled or fails after PrepareToInstall stopped an existing
+  // feeder, never strand the previously working installation offline. Starting
+  // an already-running service after a successful upgrade is harmless.
+  if IsUpgrade then begin
+    ServiceExe := ExpandConstant('{app}\service\adsbiq-service.exe');
+    if FileExists(ServiceExe) then
+      Exec(ServiceExe, 'start', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;
 

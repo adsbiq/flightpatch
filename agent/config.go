@@ -14,21 +14,23 @@ import (
 // so a device registers exactly once and keeps its server-issued token.
 type DeviceConfig struct {
 	DeviceID   string `json:"device_id"`            // locally generated, server-confirmed, stable
-	Token      string `json:"token"`               // per-device auth (X-Device-Token)
-	OrgName    string `json:"org_name,omitempty"`  // optional school/FBO name (first-run)
-	UserEmail  string `json:"user_email,omitempty"`// optional owner email
-	Server     string `json:"server"`              // https://adsbiq.com (control plane)
-	Feed       string `json:"feed"`                // feed.adsbiq.com:30004 (ADS-B Beast)
-	LocalBeast string `json:"local_beast"`         // 127.0.0.1:30005 (decoder Beast out)
+	Token      string `json:"token"`                // per-device auth (X-Device-Token)
+	OrgName    string `json:"org_name,omitempty"`   // optional school/FBO name (first-run)
+	UserEmail  string `json:"user_email,omitempty"` // optional owner email
+	Server     string `json:"server"`               // https://adsbiq.com (control plane)
+	Feed       string `json:"feed"`                 // feed.adsbiq.com:30004 (ADS-B Beast)
+	LocalBeast string `json:"local_beast"`          // 127.0.0.1:30005 (decoder Beast out)
 
 	// Decoder / dongle management (the installer bundles the decoders next to the
 	// agent; the agent enumerates dongles, assigns a role to each, and supervises
 	// the matching decoder).
-	DecoderDir string       `json:"decoder_dir,omitempty"` // dir holding the decoder exes (default: <exe dir>)
-	VDL2Feed   string       `json:"vdl2_feed,omitempty"`   // feed.adsbiq.com:5552 (VDL2 UDP)
-	Gain       string       `json:"gain,omitempty"`        // rtl tuner gain (default "40")
-	VDL2Freqs  []string     `json:"vdl2_freqs,omitempty"`  // VDL2 channels in Hz
-	Roles      []DongleRole `json:"roles,omitempty"`       // persisted per-serial role assignments
+	DecoderDir  string       `json:"decoder_dir,omitempty"`  // dir holding the decoder exes (default: <exe dir>)
+	VDL2Feed    string       `json:"vdl2_feed,omitempty"`    // feed.adsbiq.com:5552 (VDL2 UDP)
+	LocalVDL2   string       `json:"local_vdl2,omitempty"`   // local decoder UDP target (agent relay)
+	Gain        string       `json:"gain,omitempty"`         // rtl tuner gain (default "40")
+	DefaultRole string       `json:"default_role,omitempty"` // adsb, vdl2, or auto for new dongles
+	VDL2Freqs   []string     `json:"vdl2_freqs,omitempty"`   // VDL2 channels in Hz
+	Roles       []DongleRole `json:"roles,omitempty"`        // persisted per-serial role assignments
 
 	path string `json:"-"`
 }
@@ -103,8 +105,14 @@ func LoadConfig(path string) *DeviceConfig {
 	if c.VDL2Feed == "" {
 		c.VDL2Feed = "feed.adsbiq.com:5552"
 	}
+	if c.LocalVDL2 == "" {
+		c.LocalVDL2 = "127.0.0.1:5553"
+	}
 	if c.Gain == "" {
 		c.Gain = "40"
+	}
+	if c.DefaultRole == "" {
+		c.DefaultRole = "auto"
 	}
 	if len(c.VDL2Freqs) == 0 {
 		// Common VDL2 channels (Hz), within one 2.1 Msps window.

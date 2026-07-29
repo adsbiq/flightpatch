@@ -107,6 +107,24 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 	}
 }
 
+func TestRestartCommandRequestsServiceRelaunch(t *testing.T) {
+	if !handleCommand(&DeviceConfig{}, &DecoderManager{}, Command{ID: 7, Cmd: "restart"}) {
+		t.Fatal("restart command must request a WinSW relaunch")
+	}
+	if handleCommand(&DeviceConfig{}, &DecoderManager{}, Command{ID: 8, Cmd: "enable"}) {
+		t.Fatal("enable must be applied live, not restart the service")
+	}
+}
+
+func TestWaitReadyFailureCodesAreActionable(t *testing.T) {
+	cases := map[string]int{"": 2, "offline": 2, "starting": 3, "decoder_started": 4, "connected": 5}
+	for state, want := range cases {
+		if got := waitReadyExitCode(state); got != want {
+			t.Fatalf("state %q exit=%d, want %d", state, got, want)
+		}
+	}
+}
+
 type discard struct{}
 
 func (discard) Write(p []byte) (int, error) { return len(p), nil }

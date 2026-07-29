@@ -43,7 +43,8 @@ configure either way. *(VDL2 support is landing now; the ADS-B path is live toda
 136  dongle -> VDL2 decoder  (JSON)     /
 ```
 The **feed agent** in this repo registers your device once (optionally under your school/FBO
-name), forwards the decoder output to the ADSBiq network, and phones home every 60s — so it
+name), forwards decoder output to the ADSBiq network, reports state changes immediately,
+and phones home every 30s for liveness — so it
 keeps itself **up to date automatically** and can be paused, resumed, or retuned remotely
 without you touching the machine. It reconnects on its own after any drop, reboot, or outage.
 Because it always dials **out**, nothing needs an open inbound port or a static IP.

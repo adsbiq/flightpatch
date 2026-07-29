@@ -19,7 +19,8 @@ no configuration.
 2. **Plug your dongle in** when the installer asks — the driver only binds to a
    dongle that's connected during setup.
 3. Run the installer. Optionally **name your airfield** (flight school / FBO) so
-   your feeder shows up under it. Click through.
+   your feeder shows up under it. Choose ADS-B (recommended), VDL2, or the slower
+   automatic radio scan. Click through.
 4. You're live — it opens **flightpatch.app/setup** to connect the feeder to
    your organization and airport, then your aircraft appear
    within a minute.

@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"sync/atomic"
 	"time"
 )
 
@@ -64,10 +63,7 @@ type countWriter struct {
 func (c countWriter) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
 	if c.st != nil && n > 0 {
-		before := atomic.AddInt64(&c.st.bytesFed, int64(n)) - int64(n)
-		if before == 0 {
-			c.st.notify()
-		}
+		c.st.addBytes(n)
 	}
 	return n, err
 }

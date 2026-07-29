@@ -3,8 +3,9 @@
 // One binary that: registers this machine once (optionally under a school/FBO
 // name), enumerates the attached RTL-SDR dongle(s), auto-assigns each a role
 // (ADS-B 1090 or VDL2 136 MHz), and supervises the matching decoder — forwarding
-// ADS-B Beast to the network and letting the VDL2 decoder feed directly. It
-// phones home every 60s for state + commands (enable/disable, restart, update).
+// both ADS-B Beast and VDL2 UDP output to the network. It
+// reports state edges immediately and phones home every 30s for liveness +
+// commands (enable/disable, restart, update).
 // Devices sit behind NAT, so the agent always dials out; nothing needs an
 // inbound port.
 package main
@@ -25,28 +26,29 @@ import (
 )
 
 // Version is stamped into telemetry and drives auto-update comparisons.
-const Version = "0.4.5"
+const Version = "0.4.6"
 
 func platformString() string { return runtime.GOOS + "/" + runtime.GOARCH }
 
 func main() {
 	var (
-		cfgPath    = flag.String("config", "", "config file path (default: per-OS ProgramData/etc)")
-		org        = flag.String("org", "", "school / FBO / organization name (optional, first run)")
-		email      = flag.String("email", "", "owner email (optional, first run)")
-		server     = flag.String("server", "", "control-plane base URL (default https://adsbiq.com)")
-		local      = flag.String("local", "", "local decoder Beast host:port (default 127.0.0.1:30005)")
-		decoderDir = flag.String("decoders", "", "directory holding the decoder binaries (default: agent dir)")
-		once       = flag.Bool("register-only", false, "register, print identity, and exit")
-		probeOnly  = flag.Bool("probe-only", false, "enumerate dongles, probe each role, print, and exit (no register/feed)")
-		eepromDump = flag.Bool("eeprom-dump", false, "read + back up + print dongle 0's EEPROM, then exit (read-only diagnostic)")
-		watch      = flag.Bool("watch", false, "log dongle enumeration changes every 2s (hot-plug demo; no register/feed)")
-		eepromTest = flag.Int("eeprom-selftest", -1, "reversible EEPROM write test on the given dongle index, then exit")
-		setSerial  = flag.String("set-serial", "", "diagnostic/repair: write a dongle serial, e.g. --set-serial 1=ADSBIQ001, then exit")
-		dedupe     = flag.Bool("dedupe", false, "diagnostic: enumerate, de-duplicate colliding serials, print, and exit")
-		resetUSB   = flag.Bool("reset-usb", false, "diagnostic: cycle RTL-SDR USB devices (needs elevation) so EEPROM serial writes take effect, then exit")
-		jobTest    = flag.Bool("job-test", false, "diagnostic: spawn a child in the kill-on-close job then exit; the child must die with us (no orphans)")
-		waitReady  = flag.Duration("wait-ready", 0, "wait for server-confirmed delivered feed data, then exit")
+		cfgPath     = flag.String("config", "", "config file path (default: per-OS ProgramData/etc)")
+		org         = flag.String("org", "", "school / FBO / organization name (optional, first run)")
+		email       = flag.String("email", "", "owner email (optional, first run)")
+		server      = flag.String("server", "", "control-plane base URL (default https://adsbiq.com)")
+		local       = flag.String("local", "", "local decoder Beast host:port (default 127.0.0.1:30005)")
+		decoderDir  = flag.String("decoders", "", "directory holding the decoder binaries (default: agent dir)")
+		defaultRole = flag.String("default-role", "", "role for unassigned dongles: adsb, vdl2, or auto")
+		once        = flag.Bool("register-only", false, "register, print identity, and exit")
+		probeOnly   = flag.Bool("probe-only", false, "enumerate dongles, probe each role, print, and exit (no register/feed)")
+		eepromDump  = flag.Bool("eeprom-dump", false, "read + back up + print dongle 0's EEPROM, then exit (read-only diagnostic)")
+		watch       = flag.Bool("watch", false, "log dongle enumeration changes every 2s (hot-plug demo; no register/feed)")
+		eepromTest  = flag.Int("eeprom-selftest", -1, "reversible EEPROM write test on the given dongle index, then exit")
+		setSerial   = flag.String("set-serial", "", "diagnostic/repair: write a dongle serial, e.g. --set-serial 1=ADSBIQ001, then exit")
+		dedupe      = flag.Bool("dedupe", false, "diagnostic: enumerate, de-duplicate colliding serials, print, and exit")
+		resetUSB    = flag.Bool("reset-usb", false, "diagnostic: cycle RTL-SDR USB devices (needs elevation) so EEPROM serial writes take effect, then exit")
+		jobTest     = flag.Bool("job-test", false, "diagnostic: spawn a child in the kill-on-close job then exit; the child must die with us (no orphans)")
+		waitReady   = flag.Duration("wait-ready", 0, "wait for server-confirmed delivered feed data, then exit")
 	)
 	flag.Parse()
 
@@ -60,6 +62,7 @@ func main() {
 	if *decoderDir != "" {
 		cfg.DecoderDir = *decoderDir
 	}
+	applyDefaultRole(cfg, *defaultRole)
 	if *org != "" {
 		cfg.OrgName = *org
 	}
@@ -68,17 +71,22 @@ func main() {
 	}
 	if *waitReady > 0 {
 		deadline := time.Now().Add(*waitReady)
+		lastState := ""
 		for time.Now().Before(deadline) {
 			if cfg.DeviceID != "" && cfg.Token != "" {
-				if s, err := DeviceStatus(cfg.Server, cfg.Token, cfg.DeviceID); err == nil && s.Feeding {
-					log.Printf("server confirmed feeding (%d bytes)", s.BytesFed)
-					return
+				if s, err := DeviceStatus(cfg.Server, cfg.Token, cfg.DeviceID); err == nil {
+					lastState = s.State
+					if s.Feeding {
+						log.Printf("server confirmed feeding (%d bytes)", s.BytesFed)
+						return
+					}
 				}
 			}
 			time.Sleep(250 * time.Millisecond)
 			cfg = LoadConfig(*cfgPath)
 		}
-		log.Fatalf("server did not confirm feeding within %s", *waitReady)
+		log.Printf("server did not confirm feeding within %s (state=%s)", *waitReady, lastState)
+		os.Exit(waitReadyExitCode(lastState))
 	}
 
 	if *eepromDump {
@@ -213,13 +221,35 @@ func main() {
 	go mgr.run(ctx)
 
 	log.Printf("adsbiq feed agent %s (device %s); decoders in %s", Version, cfg.DeviceID, cfg.DecoderDir)
-	phoneHome(ctx, cfg, stats, mgr, stop)
+	phoneHome(ctx, cfg, stats, mgr)
 	log.Printf("stopped")
+}
+
+func applyDefaultRole(cfg *DeviceConfig, role string) {
+	if (role == RoleADSB || role == RoleVDL2 || role == "auto") && cfg.DefaultRole != role {
+		cfg.DefaultRole = role
+		cfg.Roles = nil // an explicit changed install choice supersedes old assignments
+	}
+}
+
+func waitReadyExitCode(state string) int {
+	switch state {
+	case "connected":
+		return 5 // network link exists, but the radio delivered no data
+	case "decoder_started":
+		return 4 // hardware/decoder exists, feed link did not establish
+	case "starting":
+		return 3 // registered but no decoder role became active
+	default:
+		return 2 // agent never registered / status endpoint unreachable
+	}
 }
 
 // phoneHome reports at startup and on meaningful state edges. The periodic beat
 // is only a liveness fallback; status visibility must never wait for it.
-func phoneHome(ctx context.Context, cfg *DeviceConfig, stats *Stats, mgr *DecoderManager, stop context.CancelFunc) {
+var exitForServiceRestart = func() { os.Exit(1) }
+
+func phoneHome(ctx context.Context, cfg *DeviceConfig, stats *Stats, mgr *DecoderManager) {
 	var acked []int64
 	var prevBytes int64
 	var prevAt time.Time
@@ -236,16 +266,30 @@ func phoneHome(ctx context.Context, cfg *DeviceConfig, stats *Stats, mgr *Decode
 				"decoders": mgr.status(),
 			},
 		})
-		acked = acked[:0]
 		if err != nil {
 			log.Printf("telemetry: %v", err)
 			return
 		}
+		acked = acked[:0]
 		mgr.setEnabled(resp.Enabled)
 		applyConfig(cfg, mgr, resp.Config)
 		for _, c := range resp.Commands {
-			handleCommand(cfg, mgr, c, stop)
 			acked = append(acked, c.ID)
+			if handleCommand(cfg, mgr, c) {
+				// A restart exits non-zero so WinSW's onfailure rule relaunches
+				// the service. Ack first or the command would replay forever.
+				bytes, connected, uptime, rate := stats.snapshot(prevBytes, prevAt, time.Now())
+				if _, err := Telemetry(cfg.Server, cfg.Token, telemetryReq{
+					DeviceID: cfg.DeviceID, Version: Version, UptimeS: uptime,
+					BytesFed: bytes, MsgRate: rate, Connected: connected, Acked: acked,
+					Stats: map[string]any{"platform": platformString(), "org": cfg.OrgName, "decoders": mgr.status()},
+				}); err != nil {
+					log.Printf("command #%d ack failed; postponing restart: %v", c.ID, err)
+					return
+				}
+				exitForServiceRestart()
+				return
+			}
 		}
 	}
 
@@ -309,7 +353,7 @@ func applyConfig(cfg *DeviceConfig, mgr *DecoderManager, m map[string]any) {
 }
 
 // handleCommand runs a one-shot server command.
-func handleCommand(cfg *DeviceConfig, mgr *DecoderManager, c Command, stop context.CancelFunc) {
+func handleCommand(cfg *DeviceConfig, mgr *DecoderManager, c Command) bool {
 	log.Printf("command #%d: %s %v", c.ID, c.Cmd, c.Args)
 	switch c.Cmd {
 	case "enable":
@@ -318,25 +362,26 @@ func handleCommand(cfg *DeviceConfig, mgr *DecoderManager, c Command, stop conte
 		mgr.setEnabled(false)
 	case "restart":
 		log.Printf("restart requested; exiting for the service to relaunch")
-		stop()
+		return true
 	case "update":
 		tag, url, err := checkUpdate(Version)
 		if err != nil {
 			log.Printf("update check failed: %v", err)
-			return
+			return false
 		}
 		if url == "" {
 			log.Printf("already up to date (%s)", Version)
-			return
+			return false
 		}
 		log.Printf("updating to %s ...", tag)
 		if err := selfUpdate(url); err != nil {
 			log.Printf("self-update failed: %v", err)
-			return
+			return false
 		}
 		log.Printf("update staged; exiting for the service to relaunch into %s", tag)
-		stop()
+		return true
 	default:
 		log.Printf("unknown command %q, ignoring", c.Cmd)
 	}
+	return false
 }
