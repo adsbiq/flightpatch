@@ -25,7 +25,7 @@ import (
 )
 
 // Version is stamped into telemetry and drives auto-update comparisons.
-const Version = "0.4.4"
+const Version = "0.4.5"
 
 func platformString() string { return runtime.GOOS + "/" + runtime.GOARCH }
 

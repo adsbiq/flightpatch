@@ -10,7 +10,7 @@
 ; assemble them from the CI artifacts. Compile with: iscc flightpatch.iss
 
 #define AppName "Flightpatch"
-#define AppVer "0.4.4"
+#define AppVer "0.4.5"
 #define AppPublisher "ADSBiq"
 #define AppURL "https://flightpatch.app/setup"
 ; RTL2832U (all RTL-SDR dongles): USB VID 0x0BDA, PID 0x2838
@@ -66,8 +66,8 @@ Filename: "{app}\driver\wdi-simple.exe"; \
   Parameters: "--vid {#RtlVid} --pid {#RtlPid} --type 0 --silent --name ""RTL2832U"""; \
   StatusMsg: "Installing USB driver for your dongle..."; \
   Flags: runhidden waituntilterminated skipifdoesntexist
-; 2) install + start the background service (config written in CurStepChanged)
-Filename: "{app}\service\adsbiq-service.exe"; Parameters: "install"; Flags: runhidden waituntilterminated
+; 2) write config, then install + start the background service
+Filename: "{app}\service\adsbiq-service.exe"; Parameters: "install"; Flags: runhidden waituntilterminated; BeforeInstall: WriteServiceConfig
 Filename: "{app}\service\adsbiq-service.exe"; Parameters: "start"; Flags: runhidden waituntilterminated; AfterInstall: VerifyFeeding
 ; 3) offer to open the live map
 Filename: "{#AppURL}"; Description: "Finish setup and open my airfield"; Flags: postinstall shellexec nowait
@@ -153,12 +153,6 @@ begin
   Path := ExpandConstant('{app}\service\adsbiq-service.xml');
   if not SaveStringToFile(Path, Xml, False) then
     MsgBox('Could not write the service configuration.', mbError, MB_OK);
-end;
-
-procedure CurStepChanged(CurStep: TSetupStep);
-begin
-  if CurStep = ssPostInstall then
-    WriteServiceConfig;  // runs before the [Run] service-install entries
 end;
 
 // Upgrades must actually launch the newly installed agent. Windows keeps a
