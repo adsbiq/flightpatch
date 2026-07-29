@@ -10,7 +10,7 @@
 ; assemble them from the CI artifacts. Compile with: iscc flightpatch.iss
 
 #define AppName "Flightpatch"
-#define AppVer "0.4.2"
+#define AppVer "0.4.3"
 #define AppPublisher "ADSBiq"
 #define AppURL "https://flightpatch.app/setup"
 ; RTL2832U (all RTL-SDR dongles): USB VID 0x0BDA, PID 0x2838
@@ -159,6 +159,22 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
     WriteServiceConfig;  // runs before the [Run] service-install entries
+end;
+
+// Upgrades must actually launch the newly installed agent. Windows keeps a
+// running executable locked, and WinSW "start" is a no-op when the old service
+// is already running, so stop it before [Files] replaces anything.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+  ServiceExe: string;
+begin
+  Result := '';
+  ServiceExe := ExpandConstant('{app}\service\adsbiq-service.exe');
+  if FileExists(ServiceExe) then begin
+    WizardForm.StatusLabel.Caption := 'Stopping the existing Flightpatch service...';
+    Exec(ServiceExe, 'stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
