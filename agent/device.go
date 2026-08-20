@@ -23,11 +23,12 @@ var httpClient = &http.Client{Timeout: 20 * time.Second}
 // --- registration ---
 
 type registerReq struct {
-	DeviceID  string `json:"device_id,omitempty"` // empty on first run; server assigns
-	OrgName   string `json:"org_name,omitempty"`
-	UserEmail string `json:"user_email,omitempty"`
-	Platform  string `json:"platform"`
-	Version   string `json:"version"`
+	InstallSource string `json:"install_source,omitempty"`
+	DeviceID      string `json:"device_id,omitempty"` // empty on first run; server assigns
+	OrgName       string `json:"org_name,omitempty"`
+	UserEmail     string `json:"user_email,omitempty"`
+	Platform      string `json:"platform"`
+	Version       string `json:"version"`
 }
 
 type registerResp struct {
@@ -58,14 +59,15 @@ type Command struct {
 }
 
 type telemetryReq struct {
-	DeviceID  string         `json:"device_id"`
-	Version   string         `json:"version"`
-	UptimeS   int64          `json:"uptime_s"`
-	BytesFed  int64          `json:"bytes_fed"`
-	MsgRate   float64        `json:"msg_rate"`
-	Connected bool           `json:"connected"`
-	Acked     []int64        `json:"acked,omitempty"` // command ids handled since last poll
-	Stats     map[string]any `json:"stats,omitempty"`
+	InstallSource string         `json:"install_source,omitempty"`
+	DeviceID      string         `json:"device_id"`
+	Version       string         `json:"version"`
+	UptimeS       int64          `json:"uptime_s"`
+	BytesFed      int64          `json:"bytes_fed"`
+	MsgRate       float64        `json:"msg_rate"`
+	Connected     bool           `json:"connected"`
+	Acked         []int64        `json:"acked,omitempty"` // command ids handled since last poll
+	Stats         map[string]any `json:"stats,omitempty"`
 }
 
 type telemetryResp struct {

@@ -26,7 +26,7 @@ import (
 )
 
 // Version is stamped into telemetry and drives auto-update comparisons.
-const Version = "0.4.6"
+const Version = "0.4.7"
 
 func platformString() string { return runtime.GOOS + "/" + runtime.GOARCH }
 
@@ -191,6 +191,7 @@ func main() {
 	r, err := Register(cfg.Server, registerReq{
 		DeviceID: cfg.DeviceID, OrgName: cfg.OrgName, UserEmail: cfg.UserEmail,
 		Platform: platformString(), Version: Version,
+		InstallSource: cfg.InstallSource,
 	})
 	if err != nil {
 		if cfg.Token == "" {
@@ -260,10 +261,13 @@ func phoneHome(ctx context.Context, cfg *DeviceConfig, stats *Stats, mgr *Decode
 		resp, err := Telemetry(cfg.Server, cfg.Token, telemetryReq{
 			DeviceID: cfg.DeviceID, Version: Version, UptimeS: uptime,
 			BytesFed: bytes, MsgRate: rate, Connected: connected, Acked: acked,
+			InstallSource: cfg.InstallSource,
 			Stats: map[string]any{
-				"platform": platformString(),
-				"org":      cfg.OrgName,
-				"decoders": mgr.status(),
+				"platform":       platformString(),
+				"org":            cfg.OrgName,
+				"decoders":       mgr.status(),
+				"install_source": cfg.InstallSource,
+				"receiver_gain":  cfg.Gain,
 			},
 		})
 		if err != nil {

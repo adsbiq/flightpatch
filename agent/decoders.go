@@ -60,6 +60,10 @@ func (d Dongle) key() string {
 	return d.Serial
 }
 
+func (d Dongle) identity() string {
+	return fmt.Sprintf("%s|%s|%d", d.Serial, d.Product, d.Index)
+}
+
 type roleAssignment struct {
 	Dongle Dongle
 	Role   string
@@ -145,8 +149,9 @@ func (m *DecoderManager) status() []string {
 // (hot-plug aware); when disabled it stops everything and frees the dongles.
 func (m *DecoderManager) run(parent context.Context) {
 	type child struct {
-		cancel context.CancelFunc
-		role   string
+		cancel   context.CancelFunc
+		role     string
+		identity string
 	}
 	active := map[string]child{} // keyed by dongle key() (USB port -> unique)
 	var fwdCancel context.CancelFunc
@@ -197,11 +202,16 @@ func (m *DecoderManager) run(parent context.Context) {
 			if a.Role == RoleOff {
 				continue
 			}
-			if _, ok := active[a.Dongle.key()]; ok {
-				continue // already running
+			if running, ok := active[a.Dongle.key()]; ok {
+				if running.role == a.Role && running.identity == a.Dongle.identity() {
+					continue
+				}
+				log.Printf("receiver changed at %s; recycling decoder (old=%s new=%s)", a.Dongle.key(), running.identity, a.Dongle.identity())
+				running.cancel()
+				delete(active, a.Dongle.key())
 			}
 			dctx, dcancel := context.WithCancel(parent)
-			active[a.Dongle.key()] = child{dcancel, a.Role}
+			active[a.Dongle.key()] = child{cancel: dcancel, role: a.Role, identity: a.Dongle.identity()}
 			go m.superviseDecoder(dctx, a.Role, a.Dongle)
 			log.Printf("decoder scheduled: role=%s dongle=#%d serial=%s port=%s", a.Role, a.Dongle.Index, a.Dongle.Serial, a.Dongle.Port)
 		}

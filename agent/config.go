@@ -13,13 +13,14 @@ import (
 // DeviceConfig is the agent's persisted identity + settings. It survives restarts
 // so a device registers exactly once and keeps its server-issued token.
 type DeviceConfig struct {
-	DeviceID   string `json:"device_id"`            // locally generated, server-confirmed, stable
-	Token      string `json:"token"`                // per-device auth (X-Device-Token)
-	OrgName    string `json:"org_name,omitempty"`   // optional school/FBO name (first-run)
-	UserEmail  string `json:"user_email,omitempty"` // optional owner email
-	Server     string `json:"server"`               // https://adsbiq.com (control plane)
-	Feed       string `json:"feed"`                 // feed.adsbiq.com:30004 (ADS-B Beast)
-	LocalBeast string `json:"local_beast"`          // 127.0.0.1:30005 (decoder Beast out)
+	InstallSource string `json:"install_source,omitempty"`
+	DeviceID      string `json:"device_id"`            // locally generated, server-confirmed, stable
+	Token         string `json:"token"`                // per-device auth (X-Device-Token)
+	OrgName       string `json:"org_name,omitempty"`   // optional school/FBO name (first-run)
+	UserEmail     string `json:"user_email,omitempty"` // optional owner email
+	Server        string `json:"server"`               // https://adsbiq.com (control plane)
+	Feed          string `json:"feed"`                 // feed.adsbiq.com:30004 (ADS-B Beast)
+	LocalBeast    string `json:"local_beast"`          // 127.0.0.1:30005 (decoder Beast out)
 
 	// Decoder / dongle management (the installer bundles the decoders next to the
 	// agent; the agent enumerates dongles, assigns a role to each, and supervises
