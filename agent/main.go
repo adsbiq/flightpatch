@@ -26,7 +26,7 @@ import (
 )
 
 // Version is stamped into telemetry and drives auto-update comparisons.
-const Version = "0.4.7"
+const Version = "0.4.8"
 
 func platformString() string { return runtime.GOOS + "/" + runtime.GOARCH }
 
@@ -35,6 +35,7 @@ func main() {
 		cfgPath     = flag.String("config", "", "config file path (default: per-OS ProgramData/etc)")
 		org         = flag.String("org", "", "school / FBO / organization name (optional, first run)")
 		email       = flag.String("email", "", "owner email (optional, first run)")
+		installSource = flag.String("install-source", "", "installer provenance label (optional)")
 		server      = flag.String("server", "", "control-plane base URL (default https://adsbiq.com)")
 		local       = flag.String("local", "", "local decoder Beast host:port (default 127.0.0.1:30005)")
 		decoderDir  = flag.String("decoders", "", "directory holding the decoder binaries (default: agent dir)")
@@ -68,6 +69,12 @@ func main() {
 	}
 	if *email != "" {
 		cfg.UserEmail = *email
+	}
+	if *installSource != "" && cfg.InstallSource != *installSource {
+		cfg.InstallSource = *installSource
+		if err := cfg.Save(); err != nil {
+			log.Fatalf("cannot save install source: %v", err)
+		}
 	}
 	if *waitReady > 0 {
 		deadline := time.Now().Add(*waitReady)

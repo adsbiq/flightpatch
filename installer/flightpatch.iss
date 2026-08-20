@@ -10,7 +10,7 @@
 ; assemble them from the CI artifacts. Compile with: iscc flightpatch.iss
 
 #define AppName "Flightpatch"
-#define AppVer "0.4.7"
+#define AppVer "0.4.8"
 #define AppPublisher "ADSBiq"
 #define AppURL "https://flightpatch.app/setup"
 ; RTL2832U (all RTL-SDR dongles): USB VID 0x0BDA, PID 0x2838
@@ -148,13 +148,17 @@ end;
 // injects the optional org name) before the service is installed.
 procedure WriteServiceConfig;
 var
-  Xml, Args, Org, Path: string;
+  Xml, Args, Org, Path, InstallSource: string;
 begin
   Org := Trim(OrgPage.Values[0]);
+  InstallSource := Trim(ExpandConstant('{param:INSTALLSOURCE|flightpatch}'));
   // Embedded quotes would break the Windows command line. Preserve the name
   // visibly by converting them to apostrophes before XML/argument escaping.
   StringChangeEx(Org, '"', '''', True);
   Args := '--decoders "' + ExpandConstant('{app}\decoders') + '"';
+  StringChangeEx(InstallSource, '"', '', True);
+  if InstallSource <> '' then
+    Args := Args + ' --install-source "' + InstallSource + '"';
   case RolePage.SelectedValueIndex of
     1: Args := Args + ' --default-role vdl2';
     2: Args := Args + ' --default-role auto';
