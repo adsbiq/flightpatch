@@ -29,7 +29,7 @@ type DeviceConfig struct {
 	VDL2Feed    string       `json:"vdl2_feed,omitempty"`    // feed.adsbiq.com:5552 (VDL2 UDP)
 	LocalVDL2   string       `json:"local_vdl2,omitempty"`   // local decoder UDP target (agent relay)
 	Gain        string       `json:"gain,omitempty"`         // rtl tuner gain (default "40")
-	DefaultRole string       `json:"default_role,omitempty"` // adsb, vdl2, or auto for new dongles
+	DefaultRole string       `json:"default_role,omitempty"` // adsb, uat, vdl2, or auto for new dongles
 	VDL2Freqs   []string     `json:"vdl2_freqs,omitempty"`   // VDL2 channels in Hz
 	Roles       []DongleRole `json:"roles,omitempty"`        // persisted per-serial role assignments
 	LocalRoles  []DongleRole `json:"local_roles,omitempty"`  // user-confirmed roles; server cannot override
@@ -60,7 +60,7 @@ func (c *DeviceConfig) EnsureDeviceIdentity() error {
 // not have to re-probe on every start, and so the server can override a role.
 type DongleRole struct {
 	Serial string `json:"serial"`
-	Role   string `json:"role"` // "adsb" | "vdl2" | "off"
+	Role   string `json:"role"` // "adsb" | "uat" | "vdl2" | "off"
 }
 
 // defaultConfigPath is a per-OS location a service can write to.

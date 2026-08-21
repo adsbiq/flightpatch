@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   prepare-release:
@@ -22,7 +23,7 @@ jobs:
           gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" ||
             gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
               --title "Flightpatch ${GITHUB_REF_NAME}" \
-              --notes "Unsigned Flightpatch Windows beta. Windows may show SmartScreen warnings; see https://flightpatch.app for installation guidance."
+              --notes "Flightpatch Windows release. Executables published by this workflow are signed with Microsoft Azure Artifact Signing."
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -217,10 +218,47 @@ jobs:
           path: dist/dump1090-windows-amd64
           if-no-files-found: error
 
+  # 978 MHz UAT decoder chain. The Go agent converts uat2esnt AVR output to Beast.
+  dump978-windows:
+    needs: prepare-release
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Set up MSYS2 (mingw64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: git make mingw-w64-x86_64-gcc mingw-w64-x86_64-rtl-sdr mingw-w64-x86_64-libusb
+      - name: Build dump978 and UAT-to-ES converter
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/mutability/dump978 /tmp/dump978
+          cd /tmp/dump978
+          make dump978 uat2esnt CFLAGS="-O2 -Wall -Ifec -Wno-error"
+          test -f dump978.exe && test -f uat2esnt.exe
+      - name: Bundle decoder chain and runtime DLLs
+        run: |
+          set -euxo pipefail
+          mkdir -p dist/dump978-windows-amd64
+          cp /tmp/dump978/dump978.exe /tmp/dump978/uat2esnt.exe /mingw64/bin/rtl_sdr.exe dist/dump978-windows-amd64/
+          cp /tmp/dump978/LICENSE dist/dump978-windows-amd64/LICENSE-dump978.txt
+          for exe in /tmp/dump978/dump978.exe /tmp/dump978/uat2esnt.exe /mingw64/bin/rtl_sdr.exe; do
+            ldd "$exe" | awk '/\/mingw64\/bin\// {print $3}' | while read -r dll; do cp -nv "$dll" dist/dump978-windows-amd64/; done
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dump978-windows-amd64
+          path: dist/dump978-windows-amd64
+          if-no-files-found: error
+
   # Assemble everything + compile the one-click Flightpatch installer (unsigned).
   build-installer:
-    needs: [dumpvdl2-windows, wdi-simple-windows, dump1090-windows]
+    needs: [dumpvdl2-windows, wdi-simple-windows, dump1090-windows, dump978-windows]
     runs-on: windows-latest
+    environment: production
     steps:
       - uses: actions/checkout@v4
 
@@ -242,6 +280,7 @@ jobs:
           set -euxo pipefail
           cp artifacts/dumpvdl2-windows-amd64/* installer/dist/decoders/
           cp artifacts/dump1090-windows-amd64/*  installer/dist/decoders/
+          cp artifacts/dump978-windows-amd64/*   installer/dist/decoders/
           cp artifacts/wdi-simple-windows-amd64/* installer/dist/driver/
           # WinSW service host (stable v2, .NET Framework 4.x present on Win10/11)
           curl -fL -o installer/dist/service/WinSW.exe \
@@ -252,26 +291,78 @@ jobs:
         shell: pwsh
         run: choco install innosetup -y --no-progress
 
+      - name: Azure login for Artifact Signing
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Flightpatch binaries
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: adsbiq-signing
+          certificate-profile-name: adsbiq-public
+          files: |
+            ${{ github.workspace }}\installer\dist\adsbiq-feed-agent.exe
+            ${{ github.workspace }}\installer\dist\decoders\dump1090.exe
+            ${{ github.workspace }}\installer\dist\decoders\dumpvdl2.exe
+            ${{ github.workspace }}\installer\dist\decoders\dump978.exe
+            ${{ github.workspace }}\installer\dist\decoders\uat2esnt.exe
+            ${{ github.workspace }}\installer\dist\decoders\rtl_sdr.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: Flightpatch ADS-B and VDL2 feeder
+          description-url: https://flightpatch.app
+
       - name: Compile installer
         shell: pwsh
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\flightpatch.iss
           Get-ChildItem installer\out
 
+      - name: Sign Flightpatch installer
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: adsbiq-signing
+          certificate-profile-name: adsbiq-public
+          files-folder: ${{ github.workspace }}\installer\out
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: Flightpatch Windows installer
+          description-url: https://flightpatch.app
+
       - name: Upload setup.exe
         uses: actions/upload-artifact@v4
         with:
-          name: flightpatch-setup-unsigned
+          name: flightpatch-setup-signed
           path: installer/out/*.exe
           if-no-files-found: error
 
-      - name: Attach unsigned installer and update binary to release
+      - name: Verify signatures and attach signed installer to release
         if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
+        shell: pwsh
         run: |
-          set -euxo pipefail
-          cp installer/dist/adsbiq-feed-agent.exe \
-            installer/out/adsbiq-feed-agent-windows-amd64.exe
-          gh release upload "${GITHUB_REF_NAME}" installer/out/*.exe --clobber
+          $files = @(
+            'installer/dist/adsbiq-feed-agent.exe',
+            'installer/dist/decoders/dump1090.exe',
+            'installer/dist/decoders/dumpvdl2.exe',
+            'installer/dist/decoders/dump978.exe',
+            'installer/dist/decoders/uat2esnt.exe',
+            'installer/dist/decoders/rtl_sdr.exe'
+          ) + @(Get-ChildItem 'installer/out/*.exe' | ForEach-Object FullName)
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $file
+            if ($signature.Status -ne 'Valid') {
+              throw "Invalid Authenticode signature on $file: $($signature.Status) $($signature.StatusMessage)"
+            }
+          }
+          Copy-Item installer/dist/adsbiq-feed-agent.exe installer/out/adsbiq-feed-agent-windows-amd64.exe
+          gh release upload $env:GITHUB_REF_NAME installer/out/*.exe --clobber
         env:
           GH_TOKEN: ${{ github.token }}

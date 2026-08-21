@@ -37,6 +37,7 @@ const (
 // Roles a dongle can be assigned.
 const (
 	RoleADSB = "adsb"
+	RoleUAT  = "uat"
 	RoleVDL2 = "vdl2"
 	RoleOff  = "off"
 )
@@ -81,6 +82,22 @@ func vdl2ExeName() string {
 		return "dumpvdl2.exe"
 	}
 	return "dumpvdl2"
+}
+
+func uatExeNames() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"rtl_sdr.exe", "dump978.exe", "uat2esnt.exe"}
+	}
+	return []string{"rtl_sdr", "dump978", "uat2esnt"}
+}
+
+func uatAvailable(dir string) bool {
+	for _, name := range uatExeNames() {
+		if _, ok := exePath(dir, name); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // exePath resolves a decoder binary: first next to the agent (DecoderDir), then
@@ -216,7 +233,7 @@ func (m *DecoderManager) run(parent context.Context) {
 			_, receiverID := receiverIdentity(m.cfg.DeviceID, a.Dongle.key())
 			inventory = append(inventory, ReceiverInventory{Key: a.Dongle.key(), Serial: a.Dongle.Serial, Product: a.Dongle.Product,
 				Index: a.Dongle.Index, Role: a.Role, BeastPort: beastPort, SBSPort: sbsPort,
-				VDL2Port: vdl2Port, ReceiverID: receiverID, FrequencyHz: map[string]int64{RoleADSB: 1090000000, RoleVDL2: 136975000}[a.Role]})
+				VDL2Port: vdl2Port, ReceiverID: receiverID, FrequencyHz: map[string]int64{RoleADSB: 1090000000, RoleUAT: 978000000, RoleVDL2: 136975000}[a.Role]})
 			if a.Role == RoleOff {
 				continue
 			}
@@ -246,6 +263,11 @@ func (m *DecoderManager) run(parent context.Context) {
 		// simultaneous antenna A/B tests and mixed 1090 + VDL2 operation.
 		for _, r := range inventory {
 			if r.Role == RoleOff {
+				continue
+			}
+			// UAT owns its feeder connection because its three-process decoder
+			// pipeline emits AVR text that the agent converts to Beast in-process.
+			if r.Role == RoleUAT {
 				continue
 			}
 			key := fmt.Sprintf("%s:%s", r.Role, r.Key)
@@ -313,6 +335,7 @@ func (m *DecoderManager) assignRoles(ctx context.Context, dongles []Dongle) []ro
 	// serials no longer collide -- no EEPROM re-serialization needed.
 	_, adsbAvail := exePath(m.cfg.DecoderDir, adsbExeName())
 	_, vdl2Avail := exePath(m.cfg.DecoderDir, vdl2ExeName())
+	uatAvail := uatAvailable(m.cfg.DecoderDir)
 
 	out := make([]roleAssignment, 0, len(dongles))
 	for _, d := range dongles {
@@ -324,6 +347,8 @@ func (m *DecoderManager) assignRoles(ctx context.Context, dongles []Dongle) []ro
 			role = RoleADSB
 		case m.cfg.DefaultRole == RoleVDL2 && vdl2Avail:
 			role = RoleVDL2
+		case m.cfg.DefaultRole == RoleUAT && uatAvail:
+			role = RoleUAT
 		case adsbAvail && !vdl2Avail:
 			role = RoleADSB
 		case vdl2Avail && !adsbAvail:
@@ -490,6 +515,10 @@ func (m *DecoderManager) probeADSBBytes(ctx context.Context, d Dongle, window ti
 // superviseDecoder runs the decoder for a role, restarting it (with backoff)
 // until ctx is cancelled.
 func (m *DecoderManager) superviseDecoder(ctx context.Context, role string, d Dongle, beastPort, sbsPort, vdl2Port int) {
+	if role == RoleUAT {
+		m.superviseUAT(ctx, d)
+		return
+	}
 	backoff := 2 * time.Second
 	for {
 		if ctx.Err() != nil {
