@@ -5,7 +5,7 @@ index 666b94c..dc00000 100644
 @@ -41,6 +41,7 @@ struct dump978_reader *dump978_reader_new(int fd, int nonblock)
      if (!reader)
          return NULL;
- 
+
 +#ifndef _WIN32
      if (nonblock) {
          int flags = fcntl(fd, F_GETFL);
@@ -17,5 +17,5 @@ index 666b94c..dc00000 100644
 +#else
 +    (void)nonblock; /* stdin pipeline is intentionally blocking on Windows */
 +#endif
-         
+
      reader->fd = fd;
