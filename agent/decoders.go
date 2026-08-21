@@ -214,7 +214,7 @@ func (m *DecoderManager) run(parent context.Context) {
 				vdl2Slot++
 			}
 			_, receiverID := receiverIdentity(m.cfg.DeviceID, a.Dongle.key())
-			inventory = append(inventory, ReceiverInventory{Key: a.Dongle.key(), Serial: a.Dongle.Serial,
+			inventory = append(inventory, ReceiverInventory{Key: a.Dongle.key(), Serial: a.Dongle.Serial, Product: a.Dongle.Product,
 				Index: a.Dongle.Index, Role: a.Role, BeastPort: beastPort, SBSPort: sbsPort,
 				VDL2Port: vdl2Port, ReceiverID: receiverID, FrequencyHz: map[string]int64{RoleADSB: 1090000000, RoleVDL2: 136975000}[a.Role]})
 			if a.Role == RoleOff {

@@ -15,6 +15,7 @@ import (
 type ReceiverInventory struct {
 	Key         string `json:"key"`
 	Serial      string `json:"serial"`
+	Product     string `json:"product,omitempty"`
 	Index       int    `json:"index"`
 	Role        string `json:"role"`
 	FrequencyHz int64  `json:"frequencyHz"`

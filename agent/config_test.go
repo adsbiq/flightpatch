@@ -50,3 +50,13 @@ func TestLoadConfigDefaultsNewInstallToAuto(t *testing.T) {
 		t.Fatalf("default role = %q, want auto", cfg.DefaultRole)
 	}
 }
+
+func TestUserConfirmedLocalRoleOverridesServerRole(t *testing.T) {
+	cfg := &DeviceConfig{
+		Roles:      []DongleRole{{Serial: "port-1", Role: RoleADSB}},
+		LocalRoles: []DongleRole{{Serial: "port-1", Role: RoleVDL2}},
+	}
+	if got := cfg.roleFor("port-1"); got != RoleVDL2 {
+		t.Fatalf("roleFor = %q, want locally confirmed %q", got, RoleVDL2)
+	}
+}

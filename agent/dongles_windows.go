@@ -14,10 +14,12 @@ import (
 // enumerates on a cadence, and re-LoadDLL'ing every scan leaked a module
 // reference each call (millions/year) for no benefit.
 var (
-	rtlOnce     sync.Once
-	rtlDLL      *syscall.DLL // cached handle so EEPROM ops can FindProc too
-	rtlGetCount *syscall.Proc
-	rtlGetStr   *syscall.Proc
+	rtlOnce       sync.Once
+	rtlDLL        *syscall.DLL // cached handle so EEPROM ops can FindProc too
+	rtlGetCount   *syscall.Proc
+	rtlGetStr     *syscall.Proc
+	dongleCacheMu sync.Mutex
+	dongleCache   = make(map[string]Dongle) // USB port -> last readable identity
 )
 
 func initRtlsdr(decoderDir string) {
@@ -50,28 +52,51 @@ func enumerateDongles(decoderDir string) []Dongle {
 	}
 
 	n, _, _ := getCount.Call()
+	// Reading USB strings can fail while dump1090 has a device open.  Port
+	// enumeration does not claim the device, so use the stable physical port to
+	// retain its last readable identity instead of falsely reporting it removed.
+	ports := donglePorts(decoderDir)
+	dongleCacheMu.Lock()
+	defer dongleCacheMu.Unlock()
 	var out []Dongle
 	for i := uintptr(0); i < n; i++ {
+		port := ""
+		if int(i) < len(ports) {
+			port = ports[i]
+		}
 		var manu, prod, serial [256]byte
 		r, _, _ := getStrings.Call(i,
 			uintptr(unsafe.Pointer(&manu[0])),
 			uintptr(unsafe.Pointer(&prod[0])),
 			uintptr(unsafe.Pointer(&serial[0])))
 		if int32(r) != 0 {
+			if cached, ok := dongleCache[port]; ok && port != "" {
+				cached.Index = int(i)
+				out = append(out, cached)
+			}
 			continue
 		}
-		out = append(out, Dongle{
+		d := Dongle{
 			Index:   int(i),
 			Serial:  cstr(serial[:]),
 			Product: cstr(prod[:]),
-		})
+			Port:    port,
+		}
+		out = append(out, d)
+		if port != "" {
+			dongleCache[port] = d
+		}
 	}
-	// Attach the USB port path (unique per physical device even when serials
-	// collide). ports is indexed by librtlsdr device index.
-	ports := donglePorts(decoderDir)
-	for i := range out {
-		if out[i].Index >= 0 && out[i].Index < len(ports) {
-			out[i].Port = ports[out[i].Index]
+	// Forget devices whose physical ports are no longer enumerated.
+	present := make(map[string]bool, len(ports))
+	for _, port := range ports {
+		if port != "" {
+			present[port] = true
+		}
+	}
+	for port := range dongleCache {
+		if !present[port] {
+			delete(dongleCache, port)
 		}
 	}
 	return out

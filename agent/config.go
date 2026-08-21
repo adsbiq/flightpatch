@@ -32,6 +32,7 @@ type DeviceConfig struct {
 	DefaultRole string       `json:"default_role,omitempty"` // adsb, vdl2, or auto for new dongles
 	VDL2Freqs   []string     `json:"vdl2_freqs,omitempty"`   // VDL2 channels in Hz
 	Roles       []DongleRole `json:"roles,omitempty"`        // persisted per-serial role assignments
+	LocalRoles  []DongleRole `json:"local_roles,omitempty"`  // user-confirmed roles; server cannot override
 
 	path string `json:"-"`
 }
@@ -132,6 +133,11 @@ func LoadConfig(path string) *DeviceConfig {
 
 // roleFor returns the persisted role for a dongle serial, or "" if unassigned.
 func (c *DeviceConfig) roleFor(serial string) string {
+	for _, r := range c.LocalRoles {
+		if r.Serial == serial {
+			return r.Role
+		}
+	}
 	for _, r := range c.Roles {
 		if r.Serial == serial {
 			return r.Role
