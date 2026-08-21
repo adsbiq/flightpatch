@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -25,6 +29,22 @@ func runVDL2Forward(ctx context.Context, local, remote string, st *Stats) error 
 		return err
 	}
 	defer dst.Close()
+	var history *bufio.Writer
+	var historyFile *os.File
+	if base := os.Getenv("ProgramData"); base != "" {
+		dir := filepath.Join(base, "ADSBiq")
+		_ = os.MkdirAll(dir, 0755)
+		path := filepath.Join(dir, "vdl2-history.jsonl")
+		if info, e := os.Stat(path); e == nil && info.Size() > 16*1024*1024 {
+			_ = os.Rename(path, path+".previous")
+		}
+		if f, e := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); e == nil {
+			historyFile = f
+			history = bufio.NewWriterSize(f, 64*1024)
+			defer history.Flush()
+			defer historyFile.Close()
+		}
+	}
 	buf := make([]byte, 64*1024)
 	for {
 		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
@@ -48,5 +68,14 @@ func runVDL2Forward(ctx context.Context, local, remote string, st *Stats) error 
 		}
 		st.setLink(vdl2LinkBit, true)
 		st.addBytes(wrote)
+		if history != nil && json.Valid(buf[:n]) {
+			entry, _ := json.Marshal(struct {
+				ReceivedAt string          `json:"receivedAt"`
+				Payload    json.RawMessage `json:"payload"`
+			}{time.Now().UTC().Format(time.RFC3339Nano), append(json.RawMessage(nil), buf[:n]...)})
+			_, _ = history.Write(entry)
+			_ = history.WriteByte('\n')
+			_ = history.Flush()
+		}
 	}
 }

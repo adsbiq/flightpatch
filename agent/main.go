@@ -26,30 +26,30 @@ import (
 )
 
 // Version is stamped into telemetry and drives auto-update comparisons.
-const Version = "0.4.8"
+const Version = "0.4.9"
 
 func platformString() string { return runtime.GOOS + "/" + runtime.GOARCH }
 
 func main() {
 	var (
-		cfgPath     = flag.String("config", "", "config file path (default: per-OS ProgramData/etc)")
-		org         = flag.String("org", "", "school / FBO / organization name (optional, first run)")
-		email       = flag.String("email", "", "owner email (optional, first run)")
+		cfgPath       = flag.String("config", "", "config file path (default: per-OS ProgramData/etc)")
+		org           = flag.String("org", "", "school / FBO / organization name (optional, first run)")
+		email         = flag.String("email", "", "owner email (optional, first run)")
 		installSource = flag.String("install-source", "", "installer provenance label (optional)")
-		server      = flag.String("server", "", "control-plane base URL (default https://adsbiq.com)")
-		local       = flag.String("local", "", "local decoder Beast host:port (default 127.0.0.1:30005)")
-		decoderDir  = flag.String("decoders", "", "directory holding the decoder binaries (default: agent dir)")
-		defaultRole = flag.String("default-role", "", "role for unassigned dongles: adsb, vdl2, or auto")
-		once        = flag.Bool("register-only", false, "register, print identity, and exit")
-		probeOnly   = flag.Bool("probe-only", false, "enumerate dongles, probe each role, print, and exit (no register/feed)")
-		eepromDump  = flag.Bool("eeprom-dump", false, "read + back up + print dongle 0's EEPROM, then exit (read-only diagnostic)")
-		watch       = flag.Bool("watch", false, "log dongle enumeration changes every 2s (hot-plug demo; no register/feed)")
-		eepromTest  = flag.Int("eeprom-selftest", -1, "reversible EEPROM write test on the given dongle index, then exit")
-		setSerial   = flag.String("set-serial", "", "diagnostic/repair: write a dongle serial, e.g. --set-serial 1=ADSBIQ001, then exit")
-		dedupe      = flag.Bool("dedupe", false, "diagnostic: enumerate, de-duplicate colliding serials, print, and exit")
-		resetUSB    = flag.Bool("reset-usb", false, "diagnostic: cycle RTL-SDR USB devices (needs elevation) so EEPROM serial writes take effect, then exit")
-		jobTest     = flag.Bool("job-test", false, "diagnostic: spawn a child in the kill-on-close job then exit; the child must die with us (no orphans)")
-		waitReady   = flag.Duration("wait-ready", 0, "wait for server-confirmed delivered feed data, then exit")
+		server        = flag.String("server", "", "control-plane base URL (default https://adsbiq.com)")
+		local         = flag.String("local", "", "local decoder Beast host:port (default 127.0.0.1:30005)")
+		decoderDir    = flag.String("decoders", "", "directory holding the decoder binaries (default: agent dir)")
+		defaultRole   = flag.String("default-role", "", "role for unassigned dongles: adsb, vdl2, or auto")
+		once          = flag.Bool("register-only", false, "register, print identity, and exit")
+		probeOnly     = flag.Bool("probe-only", false, "enumerate dongles, probe each role, print, and exit (no register/feed)")
+		eepromDump    = flag.Bool("eeprom-dump", false, "read + back up + print dongle 0's EEPROM, then exit (read-only diagnostic)")
+		watch         = flag.Bool("watch", false, "log dongle enumeration changes every 2s (hot-plug demo; no register/feed)")
+		eepromTest    = flag.Int("eeprom-selftest", -1, "reversible EEPROM write test on the given dongle index, then exit")
+		setSerial     = flag.String("set-serial", "", "diagnostic/repair: write a dongle serial, e.g. --set-serial 1=ADSBIQ001, then exit")
+		dedupe        = flag.Bool("dedupe", false, "diagnostic: enumerate, de-duplicate colliding serials, print, and exit")
+		resetUSB      = flag.Bool("reset-usb", false, "diagnostic: cycle RTL-SDR USB devices (needs elevation) so EEPROM serial writes take effect, then exit")
+		jobTest       = flag.Bool("job-test", false, "diagnostic: spawn a child in the kill-on-close job then exit; the child must die with us (no orphans)")
+		waitReady     = flag.Duration("wait-ready", 0, "wait for server-confirmed delivered feed data, then exit")
 	)
 	flag.Parse()
 
@@ -275,6 +275,7 @@ func phoneHome(ctx context.Context, cfg *DeviceConfig, stats *Stats, mgr *Decode
 				"decoders":       mgr.status(),
 				"install_source": cfg.InstallSource,
 				"receiver_gain":  cfg.Gain,
+				"receivers":      mgr.inventory(),
 			},
 		})
 		if err != nil {

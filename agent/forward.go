@@ -17,6 +17,7 @@ type Config struct {
 	Feed        string // adsbiq Beast ingest, e.g. feed.adsbiq.com:30004
 	DialTimeout time.Duration
 	RetryDelay  time.Duration
+	ReceiverID  []byte // optional stable 8-byte Beast receiver identity
 }
 
 func DefaultConfig() Config {
@@ -68,6 +69,20 @@ func (c countWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+func beastReceiverFrame(receiverID []byte) []byte {
+	if len(receiverID) != 8 {
+		return nil
+	}
+	frame := []byte{0x1a, 0xe3}
+	for _, b := range receiverID {
+		frame = append(frame, b)
+		if b == 0x1a {
+			frame = append(frame, 0x1a)
+		}
+	}
+	return frame
+}
+
 // Run forwards Beast bytes local->feed forever, reconnecting on any drop, until ctx is
 // cancelled (then returns ctx.Err()). Byte/connection telemetry is off (nil stats).
 func Run(ctx context.Context, cfg Config) error { return runForward(ctx, cfg, nil) }
@@ -90,6 +105,14 @@ func runForward(ctx context.Context, cfg Config, st *Stats) error {
 		}
 		if st != nil {
 			st.setConnected(true)
+		}
+		if len(cfg.ReceiverID) == 8 {
+			frame := beastReceiverFrame(cfg.ReceiverID)
+			if _, err = dst.Write(frame); err != nil {
+				src.Close()
+				dst.Close()
+				continue
+			}
 		}
 		// Tear both conns down if the context is cancelled while io.Copy is blocked.
 		stop := context.AfterFunc(ctx, func() { src.Close(); dst.Close() })

@@ -104,9 +104,10 @@ type DecoderManager struct {
 	cfg   *DeviceConfig
 	stats *Stats
 
-	mu      sync.Mutex
-	enabled bool
-	active  []string // "role@serial" of running decoders, for telemetry
+	mu        sync.Mutex
+	enabled   bool
+	active    []string // "role@serial" of running decoders, for telemetry
+	receivers []ReceiverInventory
 }
 
 func newDecoderManager(cfg *DeviceConfig, stats *Stats) *DecoderManager {
@@ -144,38 +145,47 @@ func (m *DecoderManager) status() []string {
 	return out
 }
 
+func (m *DecoderManager) setInventory(v []ReceiverInventory) {
+	m.mu.Lock()
+	m.receivers = append([]ReceiverInventory(nil), v...)
+	m.mu.Unlock()
+}
+func (m *DecoderManager) inventory() []ReceiverInventory {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]ReceiverInventory(nil), m.receivers...)
+}
+
 // run reconciles desired vs actual every 10s until parent is cancelled: when
 // enabled it enumerates dongles, assigns roles, and starts/stops decoders
 // (hot-plug aware); when disabled it stops everything and frees the dongles.
 func (m *DecoderManager) run(parent context.Context) {
 	type child struct {
-		cancel   context.CancelFunc
-		role     string
-		identity string
+		cancel    context.CancelFunc
+		role      string
+		identity  string
+		beastPort int
+		sbsPort   int
+		vdl2Port  int
 	}
 	active := map[string]child{} // keyed by dongle key() (USB port -> unique)
-	var fwdCancel context.CancelFunc
-	var vdlCancel context.CancelFunc
+	forwarders := map[string]context.CancelFunc{}
 
 	stopAll := func() {
 		for s, c := range active {
 			c.cancel()
 			delete(active, s)
 		}
-		if fwdCancel != nil {
-			fwdCancel()
-			fwdCancel = nil
-		}
-		if vdlCancel != nil {
-			vdlCancel()
-			vdlCancel = nil
+		for key, cancel := range forwarders {
+			cancel()
+			delete(forwarders, key)
 		}
 		m.setActive(nil)
 	}
 
 	reconcile := func() {
 		if !m.isEnabled() {
-			if len(active) > 0 || fwdCancel != nil {
+			if len(active) > 0 || len(forwarders) > 0 {
 				log.Printf("feeding disabled; stopping decoders")
 				stopAll()
 			}
@@ -190,20 +200,29 @@ func (m *DecoderManager) run(parent context.Context) {
 		}
 		assigns := m.assignRoles(parent, dongles)
 		seen := map[string]bool{}
-		wantForward := false
-		wantVDL2 := false
+		wantedForwarders := map[string]bool{}
+		inventory := make([]ReceiverInventory, 0, len(assigns))
+		adsbSlot, vdl2Slot := 0, 0
 		for _, a := range assigns {
 			seen[a.Dongle.key()] = true
+			beastPort, sbsPort, vdl2Port := 0, 0, 0
 			if a.Role == RoleADSB {
-				wantForward = true
+				beastPort, sbsPort = 30005+adsbSlot*100, 30003+adsbSlot*100
+				adsbSlot++
 			} else if a.Role == RoleVDL2 {
-				wantVDL2 = true
+				vdl2Port = 5553 + vdl2Slot
+				vdl2Slot++
 			}
+			_, receiverID := receiverIdentity(m.cfg.DeviceID, a.Dongle.key())
+			inventory = append(inventory, ReceiverInventory{Key: a.Dongle.key(), Serial: a.Dongle.Serial,
+				Index: a.Dongle.Index, Role: a.Role, BeastPort: beastPort, SBSPort: sbsPort,
+				VDL2Port: vdl2Port, ReceiverID: receiverID, FrequencyHz: map[string]int64{RoleADSB: 1090000000, RoleVDL2: 136975000}[a.Role]})
 			if a.Role == RoleOff {
 				continue
 			}
 			if running, ok := active[a.Dongle.key()]; ok {
-				if running.role == a.Role && running.identity == a.Dongle.identity() {
+				if running.role == a.Role && running.identity == a.Dongle.identity() &&
+					running.beastPort == beastPort && running.sbsPort == sbsPort && running.vdl2Port == vdl2Port {
 					continue
 				}
 				log.Printf("receiver changed at %s; recycling decoder (old=%s new=%s)", a.Dongle.key(), running.identity, a.Dongle.identity())
@@ -211,8 +230,8 @@ func (m *DecoderManager) run(parent context.Context) {
 				delete(active, a.Dongle.key())
 			}
 			dctx, dcancel := context.WithCancel(parent)
-			active[a.Dongle.key()] = child{cancel: dcancel, role: a.Role, identity: a.Dongle.identity()}
-			go m.superviseDecoder(dctx, a.Role, a.Dongle)
+			active[a.Dongle.key()] = child{cancel: dcancel, role: a.Role, identity: a.Dongle.identity(), beastPort: beastPort, sbsPort: sbsPort, vdl2Port: vdl2Port}
+			go m.superviseDecoder(dctx, a.Role, a.Dongle, beastPort, sbsPort, vdl2Port)
 			log.Printf("decoder scheduled: role=%s dongle=#%d serial=%s port=%s", a.Role, a.Dongle.Index, a.Dongle.Serial, a.Dongle.Port)
 		}
 		// stop decoders whose dongle was unplugged
@@ -223,38 +242,46 @@ func (m *DecoderManager) run(parent context.Context) {
 				delete(active, s)
 			}
 		}
-		// forwarder runs whenever an ADS-B dongle is present
-		if wantForward && fwdCancel == nil {
-			fctx, fcancel := context.WithCancel(parent)
-			fwdCancel = fcancel
-			go func() {
-				_ = runForward(fctx, Config{Local: m.cfg.LocalBeast, Feed: m.cfg.Feed,
-					DialTimeout: 10 * time.Second, RetryDelay: 5 * time.Second}, m.stats)
-			}()
-			log.Printf("ADS-B forwarder started (%s -> %s)", m.cfg.LocalBeast, m.cfg.Feed)
-		} else if !wantForward && fwdCancel != nil {
-			fwdCancel()
-			fwdCancel = nil
-		}
-		if wantVDL2 && vdlCancel == nil {
-			vctx, vcancel := context.WithCancel(parent)
-			vdlCancel = vcancel
-			go func() {
-				for vctx.Err() == nil {
-					if err := runVDL2Forward(vctx, m.cfg.LocalVDL2, m.cfg.VDL2Feed, m.stats); err != nil && vctx.Err() == nil {
-						log.Printf("VDL2 relay failed: %v (retry 2s)", err)
-						if !sleepCtx(vctx, 2*time.Second) {
+		// Each receiver gets its own local decoder port and relay. This permits
+		// simultaneous antenna A/B tests and mixed 1090 + VDL2 operation.
+		for _, r := range inventory {
+			if r.Role == RoleOff {
+				continue
+			}
+			key := fmt.Sprintf("%s:%s", r.Role, r.Key)
+			wantedForwarders[key] = true
+			if _, ok := forwarders[key]; ok {
+				continue
+			}
+			fctx, cancel := context.WithCancel(parent)
+			forwarders[key] = cancel
+			if r.Role == RoleADSB {
+				local := fmt.Sprintf("127.0.0.1:%d", r.BeastPort)
+				rawID, _ := receiverIdentity(m.cfg.DeviceID, r.Key)
+				go func(local string, receiverID []byte) {
+					_ = runForward(fctx, Config{Local: local, Feed: m.cfg.Feed, DialTimeout: 10 * time.Second, RetryDelay: 5 * time.Second, ReceiverID: receiverID}, m.stats)
+				}(local, rawID)
+				log.Printf("ADS-B forwarder started (%s -> %s)", local, m.cfg.Feed)
+			} else {
+				local := fmt.Sprintf("127.0.0.1:%d", r.VDL2Port)
+				go func(local string) {
+					for fctx.Err() == nil {
+						if err := runVDL2Forward(fctx, local, m.cfg.VDL2Feed, m.stats); err != nil && fctx.Err() == nil && !sleepCtx(fctx, 2*time.Second) {
 							return
 						}
 					}
-				}
-			}()
-			log.Printf("VDL2 forwarder started (%s -> %s)", m.cfg.LocalVDL2, m.cfg.VDL2Feed)
-		} else if !wantVDL2 && vdlCancel != nil {
-			vdlCancel()
-			vdlCancel = nil
-			m.stats.setLink(vdl2LinkBit, false)
+				}(local)
+				log.Printf("VDL2 forwarder started (%s -> %s)", local, m.cfg.VDL2Feed)
+			}
 		}
+		for key, cancel := range forwarders {
+			if !wantedForwarders[key] {
+				cancel()
+				delete(forwarders, key)
+			}
+		}
+		_ = writeReceiverInventory(m.cfg, inventory)
+		m.setInventory(inventory)
 		// publish status
 		st := make([]string, 0, len(active))
 		for s, c := range active {
@@ -462,13 +489,13 @@ func (m *DecoderManager) probeADSBBytes(ctx context.Context, d Dongle, window ti
 
 // superviseDecoder runs the decoder for a role, restarting it (with backoff)
 // until ctx is cancelled.
-func (m *DecoderManager) superviseDecoder(ctx context.Context, role string, d Dongle) {
+func (m *DecoderManager) superviseDecoder(ctx context.Context, role string, d Dongle, beastPort, sbsPort, vdl2Port int) {
 	backoff := 2 * time.Second
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		cmd, err := m.buildDecoderCmd(ctx, role, d)
+		cmd, err := m.buildDecoderCmd(ctx, role, d, beastPort, sbsPort, vdl2Port)
 		if err != nil {
 			log.Printf("%s decoder unavailable for dongle #%d: %v (retry 30s)", role, d.Index, err)
 			if !sleepCtx(ctx, 30*time.Second) {
@@ -505,7 +532,7 @@ func (m *DecoderManager) superviseDecoder(ctx context.Context, role string, d Do
 }
 
 // buildDecoderCmd constructs the decoder command for a role/dongle.
-func (m *DecoderManager) buildDecoderCmd(ctx context.Context, role string, d Dongle) (*exec.Cmd, error) {
+func (m *DecoderManager) buildDecoderCmd(ctx context.Context, role string, d Dongle, beastPort, sbsPort, vdl2Port int) (*exec.Cmd, error) {
 	switch role {
 	case RoleADSB:
 		exe, ok := exePath(m.cfg.DecoderDir, adsbExeName())
@@ -514,13 +541,14 @@ func (m *DecoderManager) buildDecoderCmd(ctx context.Context, role string, d Don
 		}
 		// dump1090 serves Beast on :30005; the forwarder relays it to the network.
 		return exec.CommandContext(ctx, exe, "--device-index", strconv.Itoa(d.Index),
-			"--net", "--net-beast", "--net-bo-port", "30005"), nil
+			"--net", "--net-beast", "--net-bo-port", strconv.Itoa(beastPort),
+			"--net-sbs-port", strconv.Itoa(sbsPort)), nil
 	case RoleVDL2:
 		exe, ok := exePath(m.cfg.DecoderDir, vdl2ExeName())
 		if !ok {
 			return nil, fmt.Errorf("%s not found in %s", vdl2ExeName(), m.cfg.DecoderDir)
 		}
-		host, port := splitHostPort(m.cfg.LocalVDL2)
+		host, port := "127.0.0.1", strconv.Itoa(vdl2Port)
 		args := []string{"--rtlsdr", strconv.Itoa(d.Index), "--gain", m.cfg.Gain,
 			"--output", fmt.Sprintf("decoded:json:udp:address=%s,port=%s", host, port)}
 		args = append(args, m.cfg.VDL2Freqs...)
