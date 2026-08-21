@@ -226,6 +226,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
+      - uses: actions/checkout@v4
       - name: Set up MSYS2 (mingw64)
         uses: msys2/setup-msys2@v2
         with:
@@ -236,6 +237,7 @@ jobs:
         run: |
           set -euxo pipefail
           git clone --depth 1 https://github.com/mutability/dump978 /tmp/dump978
+          git -C /tmp/dump978 apply --ignore-whitespace --verbose "$(pwd)/installer/patches/dump978-mingw.patch"
           cd /tmp/dump978
           make dump978 uat2esnt CFLAGS="-O2 -Wall -Ifec -Wno-error"
           test -f dump978.exe && test -f uat2esnt.exe
