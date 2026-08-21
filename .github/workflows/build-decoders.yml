@@ -237,8 +237,11 @@ jobs:
         run: |
           set -euxo pipefail
           git clone --depth 1 https://github.com/mutability/dump978 /tmp/dump978
-          git -C /tmp/dump978 apply --ignore-whitespace --verbose "$(pwd)/installer/patches/dump978-mingw.patch"
           cd /tmp/dump978
+          # reader.c requests POSIX nonblocking stdin; the Windows pipeline is
+          # intentionally blocking, so compile that small block out.
+          sed -i '44i#ifndef _WIN32' reader.c
+          sed -i '54i#else\n    (void)nonblock;\n#endif' reader.c
           make dump978 uat2esnt CFLAGS="-O2 -Wall -Ifec -Wno-error"
           test -f dump978.exe && test -f uat2esnt.exe
       - name: Bundle decoder chain and runtime DLLs
