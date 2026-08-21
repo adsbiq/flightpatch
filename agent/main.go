@@ -1,8 +1,8 @@
-// ADSBiq feed agent â€” the device core.
+// ADSBiq feed agent Ã¢â‚¬â€ the device core.
 //
 // One binary that: registers this machine once (optionally under a school/FBO
 // name), enumerates the attached RTL-SDR dongle(s), auto-assigns each a role
-// (ADS-B 1090 or VDL2 136 MHz), and supervises the matching decoder â€” forwarding
+// (ADS-B 1090 or VDL2 136 MHz), and supervises the matching decoder Ã¢â‚¬â€ forwarding
 // both ADS-B Beast and VDL2 UDP output to the network. It
 // reports state edges immediately and phones home every 30s for liveness +
 // commands (enable/disable, restart, update).
@@ -26,7 +26,7 @@ import (
 )
 
 // Version is stamped into telemetry and drives auto-update comparisons.
-const Version = "0.4.12"
+const Version = "0.4.13"
 
 func platformString() string { return runtime.GOOS + "/" + runtime.GOARCH }
 
@@ -133,7 +133,7 @@ func main() {
 			log.Fatalf("job-test: start child: %v", err)
 		}
 		assignChildToJob(cmd)
-		log.Printf("job-test: spawned child pid %d in kill-on-close job; exiting now â€” it must die with us", cmd.Process.Pid)
+		log.Printf("job-test: spawned child pid %d in kill-on-close job; exiting now Ã¢â‚¬â€ it must die with us", cmd.Process.Pid)
 		return
 	}
 
@@ -175,7 +175,7 @@ func main() {
 	}
 
 	// Diagnostic: enumerate + probe roles against real hardware, then exit.
-	// Never registers or feeds â€” safe to run any time to see what the agent sees.
+	// Never registers or feeds Ã¢â‚¬â€ safe to run any time to see what the agent sees.
 	if *probeOnly {
 		dongles := enumerateDongles(cfg.DecoderDir)
 		log.Printf("probe-only: enumerated %d dongle(s); decoders in %s", len(dongles), cfg.DecoderDir)
@@ -346,7 +346,7 @@ func applyConfig(cfg *DeviceConfig, mgr *DecoderManager, m map[string]any) {
 		cfg.Gain = v
 		changed = true
 	}
-	// {"roles": {"<serial>": "adsb|vdl2|off"}} â€” server can force a role.
+	// {"roles": {"<serial>": "adsb|vdl2|off"}} Ã¢â‚¬â€ server can force a role.
 	if roles, ok := m["roles"].(map[string]any); ok {
 		for serial, r := range roles {
 			if rs, ok := r.(string); ok && cfg.setRole(serial, rs) {

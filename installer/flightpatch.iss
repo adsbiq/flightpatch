@@ -1,4 +1,4 @@
-; ADSBiq Airport feeder â€” one-click Windows installer (Inno Setup 6).
+; ADSBiq Airport feeder Ã¢â‚¬â€ one-click Windows installer (Inno Setup 6).
 ;
 ; Assembles the feed agent + decoders into a single .exe that:
 ;   1. installs the WinUSB driver for the RTL-SDR dongle (silent, via libwdi),
@@ -6,11 +6,11 @@
 ;   3. registers a background Windows service (WinSW) that runs the agent,
 ;   4. optionally tags the device with the school / FBO name the user typed.
 ;
-; Build inputs live under installer\dist\ â€” see installer\BUILD.md for how to
+; Build inputs live under installer\dist\ Ã¢â‚¬â€ see installer\BUILD.md for how to
 ; assemble them from the CI artifacts. Compile with: iscc flightpatch.iss
 
 #define AppName "Flightpatch"
-#define AppVer "0.4.12"
+#define AppVer "0.4.13"
 #define AppPublisher "ADSBiq"
 #define AppURL "https://flightpatch.app/setup"
 ; RTL2832U (all RTL-SDR dongles): USB VID 0x0BDA, PID 0x2838
@@ -40,7 +40,7 @@ ArchitecturesAllowed=x64compatible
 UninstallDisplayName={#AppName}
 
 [Messages]
-; Onboarding copy â€” plain language, no jargon. (See PRODUCT_UX.md for the full spec.)
+; Onboarding copy Ã¢â‚¬â€ plain language, no jargon. (See PRODUCT_UX.md for the full spec.)
 WelcomeLabel2=In about a minute, your airfield goes live at flightpatch.app. We'll set up your dongle and feeder automatically, then open one short step to connect your school and airport.%n%nNo Raspberry Pi, no config, no hassle.
 FinishedHeadingLabel=Setup complete
 FinishedLabelNoIcons=Flightpatch setup has finished.
@@ -51,7 +51,7 @@ FinishedLabel=Flightpatch setup has finished.
 Source: "dist\adsbiq-feed-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; decoders + their runtime DLLs (dumpvdl2 today; dump1090 added when built)
 Source: "dist\decoders\*"; DestDir: "{app}\decoders"; Flags: ignoreversion recursesubdirs createallsubdirs
-; WinSW service host (renamed) â€” reads adsbiq-service.xml written at install time
+; WinSW service host (renamed) Ã¢â‚¬â€ reads adsbiq-service.xml written at install time
 Source: "dist\service\WinSW.exe"; DestDir: "{app}\service"; DestName: "adsbiq-service.exe"; Flags: ignoreversion
 ; silent WinUSB driver installer (libwdi wdi-simple)
 Source: "dist\driver\wdi-simple.exe"; DestDir: "{app}\driver"; Flags: ignoreversion skipifsourcedoesntexist
@@ -107,13 +107,13 @@ end;
 
 procedure InitializeWizard;
 begin
-  // Make the dongle timing impossible to miss â€” the driver only binds to a
+  // Make the dongle timing impossible to miss Ã¢â‚¬â€ the driver only binds to a
   // dongle that's connected during setup.
   CreateOutputMsgPage(wpWelcome,
     'Plug in your dongle',
     'Connect your RTL-SDR receiver now',
     'Before you continue, plug your RTL-SDR dongle into a USB port on this computer.' + #13#10 + #13#10 +
-    'Setup installs the dongle''s driver, so it needs to be connected right now â€” otherwise it won''t be able to feed.' + #13#10 + #13#10 +
+    'Setup installs the dongle''s driver, so it needs to be connected right now Ã¢â‚¬â€ otherwise it won''t be able to feed.' + #13#10 + #13#10 +
     'No dongle yet? You can close Setup and simply run it again once your dongle is plugged in.');
 
   OrgPage := CreateInputQueryPage(wpSelectDir,
