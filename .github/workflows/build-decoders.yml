@@ -1,6 +1,6 @@
 # Builds the Windows native binaries the installer bundles, under MSYS2, so no
 # local toolchain is needed: the VDL2 decoder (dumpvdl2.exe) and the silent
-# WinUSB driver installer (wdi-simple.exe, from libwdi â€” Zadig's engine).
+# WinUSB driver installer (wdi-simple.exe, from libwdi ? Zadig's engine).
 # Each job uploads an artifact and, on a tag, a release asset.
 name: build-decoders
 
@@ -107,10 +107,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
 
-  # Silent WinUSB driver installer (wdi-simple.exe from libwdi â€” Zadig's engine).
+  # Silent WinUSB driver installer (wdi-simple.exe from libwdi ? Zadig's engine).
   # Built from source with the libwdi author's own mingw recipe: the WDK 8.0
   # *redistributable* (a downloadable msi, not a full WDK install) supplies the
-  # driver co-installers, so no local WDK â€” which is what broke the earlier try.
+  # driver co-installers, so no local WDK ? which is what broke the earlier try.
   wdi-simple-windows:
     needs: prepare-release
     runs-on: windows-latest
@@ -191,7 +191,7 @@ jobs:
           set -euxo pipefail
           PATCH="$(pwd)/installer/patches/dump1090-mingw.patch"
           git clone --depth 1 https://github.com/MalcolmRobb/dump1090 /tmp/dump1090
-          # winstubs.h redefines types modern mingw provides â€” guard them to MSVC.
+          # winstubs.h redefines types modern mingw provides ? guard them to MSVC.
           git -C /tmp/dump1090 apply --ignore-whitespace --verbose "$PATCH"
           cd /tmp/dump1090
           # Link Winsock for the _WIN32 network code.
