@@ -1,6 +1,6 @@
 # Builds the Windows native binaries the installer bundles, under MSYS2, so no
 # local toolchain is needed: the VDL2 decoder (dumpvdl2.exe) and the silent
-# WinUSB driver installer (wdi-simple.exe, from libwdi — Zadig's engine).
+# WinUSB driver installer (wdi-simple.exe, from libwdi â€” Zadig's engine).
 # Each job uploads an artifact and, on a tag, a release asset.
 name: build-decoders
 
@@ -11,19 +11,18 @@ on:
 
 permissions:
   contents: write
-  id-token: write
 
 jobs:
   prepare-release:
     runs-on: ubuntu-latest
     steps:
       - name: Create GitHub release for tag
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && vars.ESIGNER_READY == 'true'
         run: |
           gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" ||
             gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
               --title "Flightpatch ${GITHUB_REF_NAME}" \
-              --notes "Flightpatch Windows release. Executables published by this workflow are signed with Microsoft Azure Artifact Signing."
+              --notes "Flightpatch Windows release. Executables published by this workflow are signed with SSL.com eSigner."
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -108,10 +107,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
 
-  # Silent WinUSB driver installer (wdi-simple.exe from libwdi — Zadig's engine).
+  # Silent WinUSB driver installer (wdi-simple.exe from libwdi â€” Zadig's engine).
   # Built from source with the libwdi author's own mingw recipe: the WDK 8.0
   # *redistributable* (a downloadable msi, not a full WDK install) supplies the
-  # driver co-installers, so no local WDK — which is what broke the earlier try.
+  # driver co-installers, so no local WDK â€” which is what broke the earlier try.
   wdi-simple-windows:
     needs: prepare-release
     runs-on: windows-latest
@@ -192,7 +191,7 @@ jobs:
           set -euxo pipefail
           PATCH="$(pwd)/installer/patches/dump1090-mingw.patch"
           git clone --depth 1 https://github.com/MalcolmRobb/dump1090 /tmp/dump1090
-          # winstubs.h redefines types modern mingw provides — guard them to MSVC.
+          # winstubs.h redefines types modern mingw provides â€” guard them to MSVC.
           git -C /tmp/dump1090 apply --ignore-whitespace --verbose "$PATCH"
           cd /tmp/dump1090
           # Link Winsock for the _WIN32 network code.
@@ -296,31 +295,20 @@ jobs:
         shell: pwsh
         run: choco install innosetup -y --no-progress
 
-      - name: Azure login for Artifact Signing
-        uses: azure/login@v3
+      - name: Sign FlightPatch binaries with SSL.com eSigner
+        if: vars.ESIGNER_READY == 'true'
+        uses: SSLcom/esigner-codesign@b7f8ff36fc0de8690fbbab8e5b4421d29802f747
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Sign Flightpatch binaries
-        uses: azure/artifact-signing-action@v2
-        with:
-          endpoint: https://eus.codesigning.azure.net/
-          signing-account-name: adsbiq-signing
-          certificate-profile-name: adsbiq-public
-          files: |
-            ${{ github.workspace }}\installer\dist\adsbiq-feed-agent.exe
-            ${{ github.workspace }}\installer\dist\decoders\dump1090.exe
-            ${{ github.workspace }}\installer\dist\decoders\dumpvdl2.exe
-            ${{ github.workspace }}\installer\dist\decoders\dump978.exe
-            ${{ github.workspace }}\installer\dist\decoders\uat2esnt.exe
-            ${{ github.workspace }}\installer\dist\decoders\rtl_sdr.exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-          description: Flightpatch ADS-B and VDL2 feeder
-          description-url: https://flightpatch.app
+          command: batch_sign
+          username: ${{ secrets.ESIGNER_USERNAME }}
+          password: ${{ secrets.ESIGNER_PASSWORD }}
+          credential_id: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.ESIGNER_TOTP_SECRET }}
+          dir_path: ${{ github.workspace }}/installer/dist
+          malware_block: true
+          override: true
+          clean_logs: true
+          environment_name: PROD
 
       - name: Compile installer
         shell: pwsh
@@ -328,29 +316,39 @@ jobs:
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\flightpatch.iss
           Get-ChildItem installer\out
 
-      - name: Sign Flightpatch installer
-        uses: azure/artifact-signing-action@v2
+      - name: Sign FlightPatch installer with SSL.com eSigner
+        if: vars.ESIGNER_READY == 'true'
+        uses: SSLcom/esigner-codesign@b7f8ff36fc0de8690fbbab8e5b4421d29802f747
         with:
-          endpoint: https://eus.codesigning.azure.net/
-          signing-account-name: adsbiq-signing
-          certificate-profile-name: adsbiq-public
-          files-folder: ${{ github.workspace }}\installer\out
-          files-folder-filter: exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-          description: Flightpatch Windows installer
-          description-url: https://flightpatch.app
+          command: batch_sign
+          username: ${{ secrets.ESIGNER_USERNAME }}
+          password: ${{ secrets.ESIGNER_PASSWORD }}
+          credential_id: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.ESIGNER_TOTP_SECRET }}
+          dir_path: ${{ github.workspace }}/installer/out
+          malware_block: true
+          override: true
+          clean_logs: true
+          environment_name: PROD
 
-      - name: Upload setup.exe
+      - name: Upload signed setup.exe
+        if: vars.ESIGNER_READY == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: flightpatch-setup-signed
           path: installer/out/*.exe
           if-no-files-found: error
 
+      - name: Upload explicitly unsigned staging setup.exe
+        if: vars.ESIGNER_READY != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: flightpatch-setup-unsigned-staging-only
+          path: installer/out/*.exe
+          if-no-files-found: error
+
       - name: Verify signatures and attach signed installer to release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && vars.ESIGNER_READY == 'true'
         shell: pwsh
         run: |
           $files = @(
