@@ -1,5 +1,14 @@
 # Flightpatch — turn-key ADS-B / VDL2 feeder
 
+> [!IMPORTANT]
+> **The Flightpatch Windows feeder is discontinued.** For a new Windows feeder, get
+> **ADSBiq Feeder** from the Microsoft Store: https://apps.microsoft.com/detail/xpfnzlbt3152v2
+> (signed, updates automatically).
+>
+> Existing Flightpatch installs keep working and keep feeding; you do not need to remove them.
+> Past releases stay on the Releases page for reference only. The Flightpatch airport display at
+> [flightpatch.app/airport](https://flightpatch.app/airport) is unaffected.
+
 **[flightpatch.app](https://flightpatch.app)** · part of the ADSBiq network
 
 Put your airfield on the live map. Plug a ~$50 USB dongle into the **computer you already
